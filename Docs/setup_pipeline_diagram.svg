@@ -1,0 +1,168 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1700" font-family="'Inter','Segoe UI',system-ui,sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#20242c"/>
+    </marker>
+    <marker id="arrowIndigo" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#4338ca"/>
+    </marker>
+    <style>
+      .eyebrow{font-size:13px;letter-spacing:3px;font-weight:600;fill:#8a93a3}
+      .h{font-size:25px;font-weight:700;fill:#20242c}
+      .lbl{font-size:16px;font-weight:600;fill:#20242c}
+      .sub{font-size:14px;fill:#5b6472}
+      .mono{font-family:'JetBrains Mono','SF Mono',ui-monospace,monospace}
+      .teal{fill:#2f6f6a}.amber{fill:#9a5b2e}.indigo{fill:#4338ca}
+    </style>
+  </defs>
+
+  <rect width="1000" height="1700" fill="#f6f7f9"/>
+
+  <!-- Title -->
+  <text x="60" y="56" class="eyebrow">SETUP PHASE · ORIENTATION + ENGAGE</text>
+  <text x="60" y="90" class="h">Question → Decomposed Teachable Target</text>
+  <text x="60" y="116" class="sub">How the tutor turns a raw learner question into a structured, scaffoldable conclusion.</text>
+  <line x1="60" y1="134" x2="940" y2="134" stroke="#dde1e7" stroke-width="1.5"/>
+
+  <!-- INPUT -->
+  <rect x="330" y="162" width="340" height="52" rx="26" fill="#fff" stroke="#20242c" stroke-width="1.5"/>
+  <text x="500" y="194" text-anchor="middle" class="mono" font-size="17" fill="#20242c">"Why do clouds exist?"</text>
+  <text x="500" y="148" text-anchor="middle" class="eyebrow">RAW INPUT</text>
+  <line x1="500" y1="214" x2="500" y2="252" stroke="#20242c" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- STAGE 1 -->
+  <text x="60" y="270" class="eyebrow">STAGE 1</text>
+  <text x="60" y="296" class="lbl" font-size="20">Question Analysis</text>
+  <text x="60" y="318" class="sub">Split the question into its substance and its grammar. They answer two different questions.</text>
+
+  <!-- content track -->
+  <rect x="60" y="338" width="410" height="186" rx="10" fill="#fff" stroke="#2f6f6a" stroke-width="1.5"/>
+  <rect x="60" y="338" width="410" height="34" rx="10" fill="#2f6f6a"/>
+  <rect x="60" y="356" width="410" height="16" fill="#2f6f6a"/>
+  <text x="80" y="361" font-size="13" letter-spacing="2" font-weight="700" fill="#fff">CONTENT · what it's about</text>
+  <text x="80" y="402" class="lbl">Keywords</text>
+  <text x="80" y="424" class="sub mono">cloud · tectonic · volcanic …</text>
+  <line x1="90" y1="440" x2="90" y2="464" stroke="#2f6f6a" stroke-width="1.5"/>
+  <text x="80" y="482" class="teal" font-size="15" font-weight="600">→ operative <tspan class="mono" font-weight="400">(clouds)</tspan></text>
+  <text x="80" y="506" class="teal" font-size="15" font-weight="600">→ action <tspan class="mono" font-weight="400">(exist)</tspan></text>
+
+  <!-- frame track -->
+  <rect x="530" y="338" width="410" height="186" rx="10" fill="#fff" stroke="#9a5b2e" stroke-width="1.5"/>
+  <rect x="530" y="338" width="410" height="34" rx="10" fill="#9a5b2e"/>
+  <rect x="530" y="356" width="410" height="16" fill="#9a5b2e"/>
+  <text x="550" y="361" font-size="13" letter-spacing="2" font-weight="700" fill="#fff">GRAMMATICAL FRAME · what answer-shape</text>
+  <text x="550" y="402" class="lbl">Interrogative</text>
+  <text x="550" y="424" class="sub mono">[ why / how / when / where ]</text>
+  <line x1="560" y1="440" x2="560" y2="464" stroke="#9a5b2e" stroke-width="1.5"/>
+  <text x="550" y="482" class="amber" font-size="15" font-weight="600">→ auxiliary <tspan class="mono" font-weight="400">(do)</tspan></text>
+  <text x="550" y="506" class="sub">tells you the <tspan font-weight="600" fill="#9a5b2e">type</tspan>, not the topic</text>
+
+  <!-- feed into hinge -->
+  <line x1="265" y1="524" x2="265" y2="566" stroke="#20242c" stroke-width="1.5"/>
+  <line x1="735" y1="524" x2="735" y2="566" stroke="#20242c" stroke-width="1.5"/>
+  <line x1="265" y1="566" x2="735" y2="566" stroke="#20242c" stroke-width="1.5"/>
+  <line x1="500" y1="566" x2="500" y2="588" stroke="#20242c" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- THE HINGE -->
+  <rect x="60" y="598" width="880" height="180" rx="12" fill="#eef0fb" stroke="#4338ca" stroke-width="2"/>
+  <text x="84" y="632" class="eyebrow" fill="#4338ca">THE HINGE — THE LOAD-BEARING MOVE</text>
+  <text x="84" y="662" class="lbl" font-size="19" fill="#20242c">The interrogative selects the <tspan fill="#4338ca">shape</tspan> of the answer</text>
+
+  <g class="mono" font-size="14.5">
+    <text x="100" y="700" class="indigo" font-weight="700">why</text>
+    <text x="180" y="700" fill="#20242c">→ causal chain</text>
+    <text x="100" y="726" class="indigo" font-weight="700">how</text>
+    <text x="180" y="726" fill="#20242c">→ process / sequence</text>
+    <text x="100" y="752" class="indigo" font-weight="700">when/where</text>
+    <text x="240" y="752" fill="#20242c">→ conditions / context</text>
+  </g>
+  <line x1="560" y1="690" x2="560" y2="760" stroke="#c7ccf2" stroke-width="1.5"/>
+  <text x="590" y="704" class="sub" font-size="14.5">So the frame doesn't just classify —</text>
+  <text x="590" y="726" class="sub" font-size="14.5">it picks the <tspan font-weight="700" fill="#4338ca">decomposition template</tspan></text>
+  <text x="590" y="748" class="sub" font-size="14.5">for Stage 2 below.</text>
+
+  <line x1="500" y1="778" x2="500" y2="816" stroke="#20242c" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- extraction output -->
+  <text x="500" y="804" text-anchor="middle" class="eyebrow">ONE LLM CALL · STRUCTURED EXTRACTION</text>
+  <rect x="250" y="826" width="500" height="150" rx="10" fill="#20242c"/>
+  <g class="mono" font-size="14.5" fill="#e8eaf0">
+    <text x="276" y="856">{</text>
+    <text x="296" y="880">operative: <tspan fill="#7fd4cc">"clouds"</tspan>,</text>
+    <text x="296" y="902">action: <tspan fill="#7fd4cc">"exist"</tspan>,</text>
+    <text x="296" y="924">question_type: <tspan fill="#b8a6f0">"why"</tspan>,</text>
+    <text x="296" y="946">target_conclusion: <tspan fill="#e6b88f">"…"</tspan>,</text>
+    <text x="296" y="968">components: [ … ]</text>
+    <text x="276" y="990" dy="-2">}</text>
+  </g>
+  <text x="500" y="826" text-anchor="middle"></text>
+
+  <line x1="500" y1="976" x2="500" y2="1014" stroke="#20242c" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- STAGE 2 -->
+  <text x="60" y="1034" class="eyebrow">STAGE 2</text>
+  <text x="60" y="1060" class="lbl" font-size="20">Conclusion Decomposition</text>
+  <text x="60" y="1082" class="sub">Break the target answer into the units a learner must acquire — in the shape the hinge chose.</text>
+
+  <!-- ANS -->
+  <rect x="230" y="1100" width="540" height="50" rx="25" fill="#fff" stroke="#20242c" stroke-width="1.5"/>
+  <text x="500" y="1131" text-anchor="middle" class="mono" font-size="14.5" fill="#20242c">ANS: "water vapour evaporates, cools, then condenses…"</text>
+  <line x1="370" y1="1150" x2="300" y2="1190" stroke="#20242c" stroke-width="1.5"/>
+  <line x1="630" y1="1150" x2="700" y2="1190" stroke="#20242c" stroke-width="1.5"/>
+
+  <!-- terminology (nodes) -->
+  <rect x="60" y="1192" width="410" height="150" rx="10" fill="#fff" stroke="#2f6f6a" stroke-width="1.5"/>
+  <rect x="60" y="1192" width="410" height="34" rx="10" fill="#2f6f6a"/>
+  <rect x="60" y="1210" width="410" height="16" fill="#2f6f6a"/>
+  <text x="80" y="1215" font-size="13" letter-spacing="2" font-weight="700" fill="#fff">TERMINOLOGY · concepts = NODES</text>
+  <text x="80" y="1256" class="sub mono" font-size="14.5">vapour · evaporate</text>
+  <text x="80" y="1280" class="sub mono" font-size="14.5">condensation · saturation</text>
+  <text x="80" y="1316" class="teal" font-size="14" font-weight="600">vocabulary the learner must possess</text>
+
+  <!-- premises (edges) -->
+  <rect x="530" y="1192" width="410" height="150" rx="10" fill="#fff" stroke="#9a5b2e" stroke-width="1.5"/>
+  <rect x="530" y="1192" width="410" height="34" rx="10" fill="#9a5b2e"/>
+  <rect x="530" y="1210" width="410" height="16" fill="#9a5b2e"/>
+  <text x="550" y="1215" font-size="13" letter-spacing="2" font-weight="700" fill="#fff">PREMISES · causal claims = EDGES</text>
+  <text x="550" y="1256" class="sub" font-size="14.5">"warm air holds more vapour than cold"</text>
+  <text x="550" y="1280" class="sub" font-size="14.5">"rising air cools"</text>
+  <text x="550" y="1316" class="amber" font-size="14" font-weight="600">propositions the learner must reach</text>
+
+  <line x1="265" y1="1342" x2="265" y2="1372" stroke="#20242c" stroke-width="1.5"/>
+  <line x1="735" y1="1342" x2="735" y2="1372" stroke="#20242c" stroke-width="1.5"/>
+  <line x1="265" y1="1372" x2="735" y2="1372" stroke="#20242c" stroke-width="1.5"/>
+  <line x1="500" y1="1372" x2="500" y2="1396" stroke="#20242c" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- hierarchy -->
+  <text x="500" y="1390" text-anchor="middle" class="eyebrow" fill="#4338ca">HIERARCHY · DIRECTED PREREQUISITE CHAIN = THE LEARNING PATH</text>
+  <g class="mono" font-size="13.5" fill="#20242c" text-anchor="middle">
+    <rect x="70" y="1410" width="150" height="40" rx="8" fill="#fff" stroke="#4338ca" stroke-width="1.5"/>
+    <text x="145" y="1435">evaporation</text>
+    <rect x="262" y="1410" width="150" height="40" rx="8" fill="#fff" stroke="#4338ca" stroke-width="1.5"/>
+    <text x="337" y="1435">water vapour</text>
+    <rect x="454" y="1410" width="160" height="40" rx="8" fill="#fff" stroke="#4338ca" stroke-width="1.5"/>
+    <text x="534" y="1435">rising air cools</text>
+    <rect x="656" y="1410" width="150" height="40" rx="8" fill="#fff" stroke="#4338ca" stroke-width="1.5"/>
+    <text x="731" y="1435">condensation</text>
+    <rect x="848" y="1410" width="92" height="40" rx="8" fill="#4338ca"/>
+    <text x="894" y="1435" fill="#fff" font-weight="700">cloud</text>
+  </g>
+  <line x1="220" y1="1430" x2="258" y2="1430" stroke="#4338ca" stroke-width="1.5" marker-end="url(#arrowIndigo)"/>
+  <line x1="412" y1="1430" x2="450" y2="1430" stroke="#4338ca" stroke-width="1.5" marker-end="url(#arrowIndigo)"/>
+  <line x1="614" y1="1430" x2="652" y2="1430" stroke="#4338ca" stroke-width="1.5" marker-end="url(#arrowIndigo)"/>
+  <line x1="806" y1="1430" x2="844" y2="1430" stroke="#4338ca" stroke-width="1.5" marker-end="url(#arrowIndigo)"/>
+
+  <line x1="500" y1="1450" x2="500" y2="1488" stroke="#20242c" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- output -->
+  <rect x="180" y="1498" width="640" height="138" rx="10" fill="#fff" stroke="#20242c" stroke-width="1.5"/>
+  <text x="204" y="1530" class="eyebrow">FEEDS THE STATE MACHINE</text>
+  <text x="204" y="1560" class="mono" font-size="15" fill="#20242c">required_components = [</text>
+  <text x="224" y="1584" class="mono" font-size="15" fill="#5b6472">{ component, <tspan fill="#2f6f6a">covered</tspan>, <tspan fill="#9a5b2e">connected</tspan> }, …</text>
+  <text x="204" y="1608" class="mono" font-size="15" fill="#20242c">]</text>
+  <text x="560" y="1564" class="sub" font-size="13.5">Investigation advances on</text>
+  <text x="560" y="1583" class="sub" font-size="13.5"><tspan fill="#2f6f6a" font-weight="600">coverage</tspan> + <tspan fill="#9a5b2e" font-weight="600">connection</tspan>.</text>
+  <text x="560" y="1606" class="sub" font-size="13.5">distance = components remaining</text>
+
+  <text x="60" y="1668" class="sub" font-size="13" font-style="italic">teal = substance (nouns / concepts) · amber = structure (grammar / claims) · indigo = the directed path the learner walks</text>
+</svg>
