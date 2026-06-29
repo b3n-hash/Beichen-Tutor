@@ -157,6 +157,28 @@ def log_structural(state: dict, tag: str, message: str) -> None:
     print(entry)
 
 
+def call_model(messages, state, what="model call"):
+    """Single chat completion with error capture. Returns the content string, or
+    None on failure (logged as a structural [WATCH] so the turn can degrade
+    gracefully instead of crashing)."""
+    try:
+        completion = client.chat.completions.create(model=MODEL, messages=messages)
+        return completion.choices[0].message.content
+    except Exception as exc:
+        log_structural(state, "WATCH", f"{what} failed: {exc}")
+        return None
+
+
+def format_phase_label(state: dict) -> str:
+    """Render the Phase/Hypothesis/Resolved/Fallback indicator line."""
+    return (
+        f"**Phase:** {state.get('phase', 'ask')} · "
+        f"**Hypothesis recorded:** {state.get('hypothesis_recorded', False)} · "
+        f"**Resolved:** {state.get('resolved', False)} · "
+        f"**Fallback rung:** {RUNG_LETTER[state.get('fallback_rung', 0)]}"
+    )
+
+
 def parse_state(reply: str):
     match = STATE_TAG_RE.match(reply)
     if not match:
@@ -239,17 +261,29 @@ def respond(message, history, state):
     messages.append({"role": "system", "content": STATE_REMINDER})
     messages.append({"role": "user", "content": message})
 
-    completion = client.chat.completions.create(model=MODEL, messages=messages)
-    raw_reply = completion.choices[0].message.content
+    raw_reply = call_model(messages, state, "primary model call")
+
+    # Graceful degradation: if the API/network call failed outright, keep state
+    # unchanged and surface a friendly message instead of crashing the turn.
+    if raw_reply is None:
+        gr.Warning("The tutor is temporarily unavailable (model call failed). Please try again.")
+        history = history + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": "⚠️ The tutor is temporarily unavailable. Your progress is "
+                                             "preserved — please send your message again."},
+        ]
+        return history, state, format_phase_label(state), "", ""
+
     visible_reply, parsed = parse_state(raw_reply)
 
     # Guard: if the model returned only a STATE tag with no body, retry once.
     if not visible_reply:
         log_structural(state, "WATCH", "empty visible reply on first attempt — retrying")
         gr.Info("Empty reply from model — retrying…")
-        completion = client.chat.completions.create(model=MODEL, messages=messages)
-        raw_reply = completion.choices[0].message.content
-        visible_reply, parsed = parse_state(raw_reply)
+        retry_raw = call_model(messages, state, "empty-reply retry")
+        if retry_raw is not None:
+            raw_reply = retry_raw
+            visible_reply, parsed = parse_state(raw_reply)
         if not visible_reply:
             log_structural(state, "WATCH", "empty visible reply on retry — returning placeholder")
             visible_reply = "(The model returned no response. Please try again.)"
@@ -263,9 +297,8 @@ def respond(message, history, state):
             {"role": "assistant", "content": raw_reply},
             {"role": "system", "content": STATE_REPAIR_MSG},
         ]
-        completion = client.chat.completions.create(model=MODEL, messages=repair_messages)
-        repaired_raw = completion.choices[0].message.content
-        repaired_visible, repaired_parsed = parse_state(repaired_raw)
+        repaired_raw = call_model(repair_messages, state, "STATE-repair retry")
+        repaired_visible, repaired_parsed = parse_state(repaired_raw) if repaired_raw is not None else ("", None)
         if repaired_parsed and repaired_visible:
             visible_reply, parsed = repaired_visible, repaired_parsed
         else:
@@ -339,11 +372,7 @@ def respond(message, history, state):
     if state["conclude_unresolved_streak"] > 1:
         log_structural(state, "WATCH", "possible missed resolution — model confirmed but never flagged resolved")
 
-    phase_label = (
-        f"**Phase:** {state['phase']} · **Hypothesis recorded:** {state['hypothesis_recorded']}"
-        f" · **Resolved:** {state['resolved']}"
-        f" · **Fallback rung:** {RUNG_LETTER[state['fallback_rung']]}"
-    )
+    phase_label = format_phase_label(state)
 
     history = history + [
         {"role": "user", "content": message},
@@ -353,7 +382,11 @@ def respond(message, history, state):
     # Edge-triggered auto-export: fire once on the false -> true transition only.
     auto_status = ""
     if state["resolved"] and not prev_resolved:
-        path = export_markdown(history, state)
+        try:
+            path = export_markdown(history, state)
+        except Exception as exc:  # auto-export must never crash the chat turn
+            log_structural(state, "WATCH", f"auto-export failed: {exc}")
+            path = None
         if path:
             auto_status = f"📝 Session resolved — auto-exported evaluation log to `{path}`"
 
@@ -377,8 +410,12 @@ def export_session(history, state):
         "turns": [{"role": t["role"], "content": t["content"]} for t in history],
         "state": state,
     }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(record, f, indent=2, ensure_ascii=False)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, ensure_ascii=False)
+    except OSError as exc:
+        print(f"[WARN] could not write session export: {exc}")
+        return f"⚠️ Could not save session: {exc}"
 
     return f"✅ Saved session to `{path}`"
 
@@ -514,8 +551,12 @@ def export_markdown(history, state):
         f"## Evaluation\n\n"
         f"{evaluation}\n"
     )
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(document)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(document)
+    except OSError as exc:
+        print(f"[WARN] could not write markdown session log: {exc}")
+        return None
 
     return path
 
@@ -553,7 +594,7 @@ def save_learner_profile(profile):
         except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError, TypeError):
             sessions = 0
 
-        os.makedirs(os.path.dirname(LEARNER_PROFILE_PATH), exist_ok=True)
+        os.makedirs(os.path.dirname(LEARNER_PROFILE_PATH) or ".", exist_ok=True)
         record = {
             "profile": profile,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -634,10 +675,7 @@ def reset_for_new_query(history, state):
         "fallback_rung": 0,
         "structural_events": [],
     }
-    initial_label = (
-        "**Phase:** ask · **Hypothesis recorded:** False · **Resolved:** False · **Fallback rung:** —"
-    )
-    return [], fresh_state, initial_label, "", ""
+    return [], fresh_state, format_phase_label(fresh_state), "", ""
 
 
 # Gradio 4.44.1 gr.Chatbot has no `autoscroll` param, so observe the DOM and
