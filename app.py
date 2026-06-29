@@ -12,6 +12,17 @@ client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
 STATE_TAG_RE = re.compile(r"^\s*\[STATE\s+phase=(ask|investigate|conclude)\s+hypothesis_recorded=(true|false)\s+resolved=(true|false)\]\s*\n?", re.IGNORECASE)
 
+# Phrases that signal the tutor is confirming a learner answer — only flagged
+# when uttered during ASK or INVESTIGATE (premature confirmation).
+PREMATURE_CONFIRM_RE = re.compile(
+    r"\b(exactly|you'?re correct|that'?s right|that'?s correct|spot[ -]on|well done|"
+    r"correct!|yes,?\s+that'?s|yes,?\s+you'?ve|perfect!|great job|nicely done|"
+    r"you'?ve got it|that'?s it)\b",
+    re.IGNORECASE,
+)
+
+FALLBACK_THRESHOLD = 3  # turns stuck in same phase before a [FALLBACK] event fires
+
 SYSTEM_PROMPT = """You are an Inquiry-Based Learning tutor for Physical Geography. You never simply answer the
 Learner's question. You guide them through a three-Phase loop:
 
@@ -64,6 +75,13 @@ or phase=conclude unless a real, open Hypothesis for a question currently under 
 """
 
 
+def log_structural(state: dict, tag: str, message: str) -> None:
+    """Append a tagged structural event to state['structural_events'] and echo to stdout."""
+    entry = f"[{tag}] {message}"
+    state.setdefault("structural_events", []).append(entry)
+    print(entry)
+
+
 def parse_state(reply: str):
     match = STATE_TAG_RE.match(reply)
     if not match:
@@ -75,21 +93,21 @@ def parse_state(reply: str):
     return visible, {"phase": phase, "hypothesis_recorded": recorded, "resolved": resolved}
 
 
-def enforce_consistency(parsed):
-    """Validate the parsed state. Print a [VIOLATION] line for impossible
-    combinations and sanitize resolved so it can never be trusted while the
-    phase/hypothesis preconditions are unmet."""
+def enforce_consistency(parsed: dict) -> dict:
+    """Validate the parsed state. Log a [VIOLATION] for impossible combinations
+    and sanitize resolved so it can never be trusted while the phase/hypothesis
+    preconditions are unmet. Expects parsed to already carry 'structural_events'."""
     phase = parsed["phase"]
     recorded = parsed["hypothesis_recorded"]
     resolved = parsed["resolved"]
 
     if phase == "conclude" and not recorded:
-        print("[VIOLATION] reached conclude with no recorded hypothesis")
+        log_structural(parsed, "VIOLATION", "reached conclude with no recorded hypothesis")
 
     if resolved and not (phase == "conclude" and recorded):
-        print(
-            "[VIOLATION] resolved=true while "
-            f"phase={phase} hypothesis_recorded={recorded}; treating resolved as false"
+        log_structural(
+            parsed, "VIOLATION",
+            f"resolved=true while phase={phase} hypothesis_recorded={recorded}; treating resolved as false",
         )
         resolved = False
 
@@ -99,8 +117,15 @@ def enforce_consistency(parsed):
 
 def respond(message, history, state):
     history = history or []
-    state = state or {"phase": "ask", "hypothesis_recorded": False, "resolved": False}
+    state = state or {
+        "phase": "ask",
+        "hypothesis_recorded": False,
+        "resolved": False,
+        "attempts_this_phase": 0,
+        "structural_events": [],
+    }
     prev_resolved = bool(state.get("resolved", False))
+    prev_phase = state.get("phase", "ask")
     prev_unresolved_streak = state.get("conclude_unresolved_streak", 0)
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -112,19 +137,56 @@ def respond(message, history, state):
     raw_reply = completion.choices[0].message.content
     visible_reply, parsed = parse_state(raw_reply)
 
+    # Guard: if the model returned only a STATE tag with no body, retry once.
+    if not visible_reply:
+        log_structural(state, "WATCH", "empty visible reply on first attempt — retrying")
+        gr.Info("Empty reply from model — retrying…")
+        completion = client.chat.completions.create(model=MODEL, messages=messages)
+        raw_reply = completion.choices[0].message.content
+        visible_reply, parsed = parse_state(raw_reply)
+        if not visible_reply:
+            log_structural(state, "WATCH", "empty visible reply on retry — returning placeholder")
+            visible_reply = "(The model returned no response. Please try again.)"
+
     if parsed:
+        # Carry forward accumulated events and counters before state is replaced.
+        parsed["structural_events"] = state.get("structural_events", [])
+        parsed["attempts_this_phase"] = state.get("attempts_this_phase", 0)
+        parsed["conclude_unresolved_streak"] = prev_unresolved_streak
         state = enforce_consistency(parsed)
     state.setdefault("resolved", False)
+    state.setdefault("structural_events", [])
 
-    # Observability only (does NOT affect export): warn if the model parks in
-    # conclude with a recorded hypothesis but never flags resolved across more
-    # than one consecutive turn — a likely missed resolution tag.
+    # --- attempts_this_phase counter ------------------------------------------
+    new_phase = state["phase"]
+    if new_phase == prev_phase:
+        state["attempts_this_phase"] = state.get("attempts_this_phase", 0) + 1
+    else:
+        state["attempts_this_phase"] = 1  # reset on phase transition
+
+    if state["attempts_this_phase"] > FALLBACK_THRESHOLD:
+        log_structural(
+            state, "FALLBACK",
+            f"Learner on attempt {state['attempts_this_phase']} in phase={new_phase}; "
+            f"escalation may be overdue (threshold={FALLBACK_THRESHOLD})",
+        )
+
+    # --- lexical premature-confirmation check ---------------------------------
+    if new_phase in ("ask", "investigate"):
+        m = PREMATURE_CONFIRM_RE.search(visible_reply)
+        if m:
+            log_structural(
+                state, "VIOLATION",
+                f"lexical premature-confirmation in phase={new_phase}: '{m.group(0)}'",
+            )
+
+    # --- missed-resolution watch ----------------------------------------------
     if state["phase"] == "conclude" and state["hypothesis_recorded"] and not state["resolved"]:
-        state["conclude_unresolved_streak"] = prev_unresolved_streak + 1
+        state["conclude_unresolved_streak"] = state.get("conclude_unresolved_streak", 0) + 1
     else:
         state["conclude_unresolved_streak"] = 0
     if state["conclude_unresolved_streak"] > 1:
-        print("[WATCH] possible missed resolution — model confirmed but never flagged resolved")
+        log_structural(state, "WATCH", "possible missed resolution — model confirmed but never flagged resolved")
 
     phase_label = (
         f"**Phase:** {state['phase']} · **Hypothesis recorded:** {state['hypothesis_recorded']}"
@@ -148,7 +210,7 @@ def respond(message, history, state):
 
 def export_session(history, state):
     history = history or []
-    state = state or {"phase": "ask", "hypothesis_recorded": False}
+    state = state or {"phase": "ask", "hypothesis_recorded": False, "structural_events": []}
 
     os.makedirs("logs", exist_ok=True)
     base = datetime.now().strftime("session_%Y-%m-%d_%H-%M-%S")
@@ -256,7 +318,7 @@ def export_markdown(history, state):
     """Write a full Markdown session log (transcript + auto evaluation) to logs/.
     Returns the path written, or None if it could not be produced."""
     history = history or []
-    state = state or {"phase": "ask", "hypothesis_recorded": False, "resolved": False}
+    state = state or {"phase": "ask", "hypothesis_recorded": False, "resolved": False, "structural_events": []}
 
     os.makedirs("logs", exist_ok=True)
     base = datetime.now().strftime("session_%Y-%m-%d_%H-%M-%S")
@@ -277,6 +339,14 @@ def export_markdown(history, state):
             evaluation = f"_(evaluation call failed: {exc})_"
 
     final_phase = state.get("phase", "ask").capitalize()
+
+    structural_events = state.get("structural_events", [])
+    structural_section = (
+        "\n".join(f"- {e}" for e in structural_events)
+        if structural_events
+        else "_(none detected)_"
+    )
+
     document = (
         f"# Session Log\n\n"
         f"**Origin Question:** {origin}\n"
@@ -285,6 +355,9 @@ def export_markdown(history, state):
         f"---\n\n"
         f"## Transcript\n\n"
         f"{transcript}\n\n"
+        f"---\n\n"
+        f"## Structural Checks (non-LLM)\n\n"
+        f"{structural_section}\n\n"
         f"---\n\n"
         f"## Evaluation\n\n"
         f"{evaluation}\n"
@@ -324,7 +397,13 @@ with gr.Blocks(title="Polaris Tutor") as demo:
         )
         export_btn = gr.Button("Export Session", scale=1)
     export_status = gr.Markdown("")
-    state = gr.State({"phase": "ask", "hypothesis_recorded": False, "resolved": False})
+    state = gr.State({
+        "phase": "ask",
+        "hypothesis_recorded": False,
+        "resolved": False,
+        "attempts_this_phase": 0,
+        "structural_events": [],
+    })
 
     msg.submit(respond, [msg, chatbot, state], [chatbot, state, phase_display, msg, export_status])
     export_btn.click(export_session, [chatbot, state], export_status)
