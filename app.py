@@ -217,6 +217,15 @@ def respond(message, history, state):
             log_structural(state, "FALLBACK", "explicit surrender detected — jumping to rung D")
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if LEARNER_PROFILE:
+        messages.append({
+            "role": "system",
+            "content": (
+                f"[LEARNER PROFILE — prior session observations] {LEARNER_PROFILE}\n"
+                "Treat these as observed tendencies, not fixed constraints. Adjust your approach if this "
+                "session suggests the learner's behaviour differs."
+            ),
+        })
     for turn in history:
         messages.append({"role": turn["role"], "content": turn["content"]})
 
@@ -511,6 +520,126 @@ def export_markdown(history, state):
     return path
 
 
+# --- Persistent Learner Profile -----------------------------------------------
+
+# Accumulating behavioural profile, written at repo root under user/.
+LEARNER_PROFILE_PATH = os.path.join("user", "learner_profile.json")
+
+PROFILE_SYSTEM_MSG = (
+    "You are a concise pedagogical analyst. Your output is stored in a learner profile and injected into "
+    "future tutoring sessions. Write only what is directly useful to a tutor. No preamble, no headers, no "
+    "flattery."
+)
+
+
+def load_learner_profile():
+    """Return the stored profile string, or None if absent/malformed."""
+    try:
+        with open(LEARNER_PROFILE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        profile = data.get("profile")
+        return profile if isinstance(profile, str) and profile.strip() else None
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def save_learner_profile(profile):
+    """Persist the profile, incrementing the session counter. Never raises."""
+    try:
+        sessions = 0
+        try:
+            with open(LEARNER_PROFILE_PATH, encoding="utf-8") as f:
+                sessions = int(json.load(f).get("sessions", 0))
+        except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError, TypeError):
+            sessions = 0
+
+        os.makedirs(os.path.dirname(LEARNER_PROFILE_PATH), exist_ok=True)
+        record = {
+            "profile": profile,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "sessions": sessions + 1,
+        }
+        with open(LEARNER_PROFILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, ensure_ascii=False)
+    except Exception as exc:  # profile I/O must never crash the app
+        print(f"[WARN] could not save learner profile: {exc}")
+
+
+def generate_learner_profile(history, existing_profile):
+    """One summarisation LLM call producing an updated behavioural profile.
+    Gated on session length; the hypothesis_recorded gate is applied by the caller
+    (which holds state). On insufficient signal, returns existing_profile unchanged."""
+    history = history or []
+    if len(history) < 6:
+        return existing_profile
+
+    transcript = build_transcript(history)
+    existing_profile_block = (
+        f"Prior profile (update this):\n{existing_profile}"
+        if existing_profile
+        else "No prior profile exists. Generate from this session only."
+    )
+
+    user_message = f"""You are reviewing a completed tutoring session transcript for a single learner. Your job is to update their running behavioural profile.
+
+{existing_profile_block}
+
+Session transcript:
+---
+{transcript}
+---
+
+Produce an updated learner profile. Write one bullet point per distinct observable behavioural tendency — however many the evidence supports. Soft cap is 8–10 bullets. If a clear 11th tendency is found, include it and drop whichever existing bullet has the least relative significance to a future tutor's decision-making, as judged by you. Do not pad to reach a number and do not truncate to stay under one. Every bullet must be specific enough that a tutor who has never seen this session could adjust their approach based on it — no generic statements like "the learner benefited from guidance." Describe what the learner defaults to when stuck, what kinds of scaffolding unblocked them, where their reasoning gaps were, how they responded to hints or analogies, what vocabulary they reach for under pressure.
+
+If a prior profile exists, incorporate its observations. Update or remove any bullet that this session contradicts or supersedes. The final profile must be self-contained.
+
+Output only the bullet points, nothing else.
+"""
+
+    completion = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": PROFILE_SYSTEM_MSG},
+            {"role": "user", "content": user_message},
+        ],
+    )
+    return completion.choices[0].message.content.strip()
+
+
+# Loaded once at import; refreshed after a New Query writes an updated profile.
+LEARNER_PROFILE = load_learner_profile()
+
+
+def reset_for_new_query(history, state):
+    """New Query handler: update the persistent profile from the just-completed
+    session, then clear history and state for a fresh inquiry. A failed profile
+    call must never block the reset."""
+    state = state or {}
+    # Gate (caller half): only profile sessions where a hypothesis was recorded.
+    if state.get("hypothesis_recorded"):
+        try:
+            updated = generate_learner_profile(history or [], load_learner_profile())
+            if updated:
+                save_learner_profile(updated)
+                global LEARNER_PROFILE
+                LEARNER_PROFILE = load_learner_profile()
+        except Exception as exc:
+            print(f"[WARN] learner profile update failed: {exc}")
+
+    fresh_state = {
+        "phase": "ask",
+        "hypothesis_recorded": False,
+        "resolved": False,
+        "attempts_this_phase": 0,
+        "fallback_rung": 0,
+        "structural_events": [],
+    }
+    initial_label = (
+        "**Phase:** ask · **Hypothesis recorded:** False · **Resolved:** False · **Fallback rung:** —"
+    )
+    return [], fresh_state, initial_label, "", ""
+
+
 # Gradio 4.44.1 gr.Chatbot has no `autoscroll` param, so observe the DOM and
 # scroll the chatbot's scroll container to the bottom on every mutation. This
 # fires for both the appended user turn and the assistant reply.
@@ -539,6 +668,7 @@ with gr.Blocks(title="Polaris Tutor") as demo:
             scale=4,
         )
         export_btn = gr.Button("Export Session", scale=1)
+        new_query_btn = gr.Button("New Query", scale=1)
     export_status = gr.Markdown("")
     state = gr.State({
         "phase": "ask",
@@ -551,6 +681,11 @@ with gr.Blocks(title="Polaris Tutor") as demo:
 
     msg.submit(respond, [msg, chatbot, state], [chatbot, state, phase_display, msg, export_status])
     export_btn.click(export_session, [chatbot, state], export_status)
+    new_query_btn.click(
+        reset_for_new_query,
+        [chatbot, state],
+        [chatbot, state, phase_display, export_status, msg],
+    )
 
     demo.load(None, None, None, js=AUTOSCROLL_JS)
 

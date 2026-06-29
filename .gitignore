@@ -10,5 +10,8 @@ __pycache__/
 .venv/
 venv/
 
+# Claude
+CLAUDE.md
+
 # macOS
 .DS_Store
