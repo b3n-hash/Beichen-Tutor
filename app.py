@@ -23,6 +23,71 @@ PREMATURE_CONFIRM_RE = re.compile(
 
 FALLBACK_THRESHOLD = 3  # turns stuck in same phase before a [FALLBACK] event fires
 
+# Hard guard: strip any fallback marker the model leaks into its visible reply.
+LEAKED_FALLBACK_RE = re.compile(r"\[EXHAUSTION FALLBACK[^\]]*\]\s*", re.IGNORECASE)
+
+# fallback_rung scheme: 0=no fallback, 1=A, 2=B, 3=C, 4=D (capped at 4).
+RUNG_LETTER = {0: "—", 1: "A", 2: "B", 3: "C", 4: "D"}
+
+# Explicit-surrender patterns ("tell me the answer" etc.) — accelerate the ladder,
+# only meaningful during INVESTIGATE.
+SURRENDER_RE = re.compile(
+    r"\b(just\s+)?(tell|give)\s+me\s+(the\s+)?answer\b"
+    r"|\bwhat\s+is\s+the\s+answer\b"
+    r"|\bjust\s+tell\s+me\b",
+    re.IGNORECASE,
+)
+
+# Rung-specific instructions injected as a system message before the user's turn.
+# Keyed by fallback_rung (0 injects nothing). {n} = attempts_this_phase.
+FALLBACK_INJECTIONS = {
+    1: (
+        "[EXHAUSTION FALLBACK — RUNG A ACTIVE] The Learner has not progressed after {n} attempts in the "
+        "INVESTIGATE phase. Apply Rung A: reframe or narrow the inquiry — abandon the current angle and try a "
+        "completely different approach or a simpler sub-question. Do NOT repeat the investigative question that "
+        "has already stalled."
+    ),
+    2: (
+        "[EXHAUSTION FALLBACK — RUNG B ACTIVE] The Learner has not progressed after {n} attempts in the "
+        "INVESTIGATE phase. Apply Rung B: give a small, concrete hint — one piece of information or an analogy — "
+        "then invite the Learner to reattempt. Do NOT ask the same investigative question again."
+    ),
+    3: (
+        "[EXHAUSTION FALLBACK — RUNG C ACTIVE] The Learner has not progressed after {n} attempts in the "
+        "INVESTIGATE phase. Apply Rung C: partially scaffold — supply a worked partial answer that lays out part "
+        "of the mechanism, then ask the Learner to complete the remaining step themselves."
+    ),
+    4: (
+        "[EXHAUSTION FALLBACK — RUNG D ACTIVE] The Learner has not progressed after {n} attempts in the "
+        "INVESTIGATE phase, and Rungs A–C are exhausted. Apply Rung D: you are now permitted to state the "
+        "mechanism or near-answer explicitly. Under Rule 1 this is the legitimate closure case, NOT a violation "
+        "— providing it here is what makes the Learner's eventual restatement valid. Deliver it clearly, then "
+        "invite the Learner to restate the conclusion in their own words."
+    ),
+}
+
+# Used when the Learner surrenders again after already receiving Rung D.
+OVERRIDE_TO_CONCLUDE_MSG = (
+    "[EXHAUSTION FALLBACK — SURRENDER AT RUNG D] The Learner has explicitly surrendered again after receiving "
+    "the Rung D near-direct disclosure. Move to the CONCLUDE phase now: state the answer plainly, then invite "
+    "the Learner to restate it in their own words so they can close the inquiry."
+)
+
+# Per-turn recency reminder of the required STATE line — countering format drift
+# that emerges on long conversations once SYSTEM_PROMPT is buried in the context.
+STATE_REMINDER = (
+    "Reminder: your reply MUST begin with the exact line "
+    "[STATE phase=<ask|investigate|conclude> hypothesis_recorded=<true|false> resolved=<true|false>] "
+    "then a newline, then your reply. This is mandatory on EVERY turn, including closing or small-talk turns."
+)
+
+# Stronger corrective injected on the repair retry when a STATE line was missing.
+STATE_REPAIR_MSG = (
+    "Your previous reply omitted the mandatory STATE line. Re-send the SAME reply, but it MUST start with "
+    "[STATE phase=<ask|investigate|conclude> hypothesis_recorded=<true|false> resolved=<true|false>] on its "
+    "own first line, then a newline, then the reply text."
+)
+
 SYSTEM_PROMPT = """You are an Inquiry-Based Learning tutor for Physical Geography. You never simply answer the
 Learner's question. You guide them through a three-Phase loop:
 
@@ -41,6 +106,16 @@ state or strongly imply anything they could still deduce on their own about thei
 they have stated a Hypothesis (phase must have left ASK). This is what makes the Exhaustion Fallback's final
 rung a legitimate closure rather than a violation, not an exception to the rule. Even in INVESTIGATE, prefer
 questions and evidence over statements of fact that hand over the conclusion.
+
+Exhaustion Fallback ladder: when the Learner cannot make progress, the state machine may inject a message
+beginning [EXHAUSTION FALLBACK — RUNG X ACTIVE]. These messages are architectural instructions from the
+system, NOT the Learner's input. When one appears you must follow it precisely, overriding your default
+inquiry instinct. The rungs escalate: A — reframe/narrow the inquiry; B — give a small hint, then let them
+reattempt; C — partially scaffold with a worked partial answer for them to complete; D — state the mechanism
+or near-answer explicitly. Rung D disclosure is the legitimate closure case under the hard rule above, not an
+exception to it. NEVER write the literal text "[EXHAUSTION FALLBACK ...]" (or any "RUNG X ACTIVE" marker)
+yourself — those markers are system input to you only and must never appear anywhere in your reply to the
+Learner. Act on the rung's instruction; do not announce or quote it.
 
 When posing investigative questions, never embed the causal claim as a given premise (e.g. "If blue light
 scatters more, what happens when...?" — this hands over the very link the Learner should derive). Instead pose
@@ -122,15 +197,37 @@ def respond(message, history, state):
         "hypothesis_recorded": False,
         "resolved": False,
         "attempts_this_phase": 0,
+        "fallback_rung": 0,
         "structural_events": [],
     }
     prev_resolved = bool(state.get("resolved", False))
     prev_phase = state.get("phase", "ask")
     prev_unresolved_streak = state.get("conclude_unresolved_streak", 0)
 
+    # --- Surrender detection (accelerates the Fallback ladder) ----------------
+    # Working rung carried in from prior turns; surrender can bump it this turn.
+    fallback_rung = state.get("fallback_rung", 0)
+    override_to_conclude = False
+    if prev_phase == "investigate" and SURRENDER_RE.search(message):
+        if fallback_rung >= 4:
+            override_to_conclude = True
+            log_structural(state, "FALLBACK", "explicit surrender at rung D — moving to CONCLUDE for restatement")
+        else:
+            fallback_rung = 4
+            log_structural(state, "FALLBACK", "explicit surrender detected — jumping to rung D")
+
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for turn in history:
         messages.append({"role": turn["role"], "content": turn["content"]})
+
+    # --- Inject the active fallback rung as a system-level instruction --------
+    if override_to_conclude:
+        messages.append({"role": "system", "content": OVERRIDE_TO_CONCLUDE_MSG})
+    elif fallback_rung > 0 and prev_phase == "investigate":
+        injection = FALLBACK_INJECTIONS[fallback_rung].format(n=state.get("attempts_this_phase", 0))
+        messages.append({"role": "system", "content": injection})
+
+    messages.append({"role": "system", "content": STATE_REMINDER})
     messages.append({"role": "user", "content": message})
 
     completion = client.chat.completions.create(model=MODEL, messages=messages)
@@ -148,14 +245,40 @@ def respond(message, history, state):
             log_structural(state, "WATCH", "empty visible reply on retry — returning placeholder")
             visible_reply = "(The model returned no response. Please try again.)"
 
+    # Repair guard: a non-empty reply that omitted the STATE line (parsed is None)
+    # freezes state silently. Retry once with a stronger corrective, preferring
+    # the repaired (tagged) reply only if the retry actually produced a tag.
+    if visible_reply and parsed is None:
+        log_structural(state, "WATCH", "missing STATE line — retrying with corrective")
+        repair_messages = messages + [
+            {"role": "assistant", "content": raw_reply},
+            {"role": "system", "content": STATE_REPAIR_MSG},
+        ]
+        completion = client.chat.completions.create(model=MODEL, messages=repair_messages)
+        repaired_raw = completion.choices[0].message.content
+        repaired_visible, repaired_parsed = parse_state(repaired_raw)
+        if repaired_parsed and repaired_visible:
+            visible_reply, parsed = repaired_visible, repaired_parsed
+        else:
+            log_structural(state, "WATCH", "STATE line still missing after repair — carrying prior state")
+
+    # Hard guard: never let a leaked fallback marker reach the Learner.
+    if LEAKED_FALLBACK_RE.search(visible_reply):
+        log_structural(state, "WATCH", "stripped leaked [EXHAUSTION FALLBACK ...] marker from visible reply")
+        visible_reply = LEAKED_FALLBACK_RE.sub("", visible_reply).strip()
+
     if parsed:
         # Carry forward accumulated events and counters before state is replaced.
         parsed["structural_events"] = state.get("structural_events", [])
         parsed["attempts_this_phase"] = state.get("attempts_this_phase", 0)
         parsed["conclude_unresolved_streak"] = prev_unresolved_streak
+        parsed["fallback_rung"] = fallback_rung  # incl. any surrender bump this turn
         state = enforce_consistency(parsed)
     state.setdefault("resolved", False)
     state.setdefault("structural_events", [])
+    # Persist the working rung even when the model emitted no parseable STATE tag
+    # (parsed is None) — otherwise a surrender bump is silently dropped.
+    state["fallback_rung"] = fallback_rung
 
     # --- attempts_this_phase counter ------------------------------------------
     new_phase = state["phase"]
@@ -164,12 +287,31 @@ def respond(message, history, state):
     else:
         state["attempts_this_phase"] = 1  # reset on phase transition
 
-    if state["attempts_this_phase"] > FALLBACK_THRESHOLD:
+    if new_phase == "investigate" and state["attempts_this_phase"] > FALLBACK_THRESHOLD:
         log_structural(
             state, "FALLBACK",
             f"Learner on attempt {state['attempts_this_phase']} in phase={new_phase}; "
             f"escalation may be overdue (threshold={FALLBACK_THRESHOLD})",
         )
+
+    # --- fallback_rung escalation (drives NEXT turn's injection) ---------------
+    # Reset on any phase transition; only escalate while stuck in INVESTIGATE.
+    if new_phase != prev_phase:
+        state["fallback_rung"] = 0
+    if new_phase == "investigate":
+        attempts = state["attempts_this_phase"]
+        # rung climbs one step per FALLBACK_THRESHOLD turns, starting at the
+        # threshold: A at >3, B at >6, C at >9, D at >12 (THRESHOLD=3). Capped at 4.
+        # This aligns the first injection with the "overdue" log (no dead-zone).
+        target = max(0, min(4, (attempts - 1) // FALLBACK_THRESHOLD))
+        if target > state["fallback_rung"]:
+            state["fallback_rung"] = target
+            log_structural(
+                state, "FALLBACK",
+                f"escalating to rung {RUNG_LETTER[target]} (attempts={attempts})",
+            )
+    else:
+        state["fallback_rung"] = 0
 
     # --- lexical premature-confirmation check ---------------------------------
     if new_phase in ("ask", "investigate"):
@@ -191,6 +333,7 @@ def respond(message, history, state):
     phase_label = (
         f"**Phase:** {state['phase']} · **Hypothesis recorded:** {state['hypothesis_recorded']}"
         f" · **Resolved:** {state['resolved']}"
+        f" · **Fallback rung:** {RUNG_LETTER[state['fallback_rung']]}"
     )
 
     history = history + [
@@ -210,7 +353,7 @@ def respond(message, history, state):
 
 def export_session(history, state):
     history = history or []
-    state = state or {"phase": "ask", "hypothesis_recorded": False, "structural_events": []}
+    state = state or {"phase": "ask", "hypothesis_recorded": False, "fallback_rung": 0, "structural_events": []}
 
     os.makedirs("logs", exist_ok=True)
     base = datetime.now().strftime("session_%Y-%m-%d_%H-%M-%S")
@@ -318,7 +461,7 @@ def export_markdown(history, state):
     """Write a full Markdown session log (transcript + auto evaluation) to logs/.
     Returns the path written, or None if it could not be produced."""
     history = history or []
-    state = state or {"phase": "ask", "hypothesis_recorded": False, "resolved": False, "structural_events": []}
+    state = state or {"phase": "ask", "hypothesis_recorded": False, "resolved": False, "fallback_rung": 0, "structural_events": []}
 
     os.makedirs("logs", exist_ok=True)
     base = datetime.now().strftime("session_%Y-%m-%d_%H-%M-%S")
@@ -402,6 +545,7 @@ with gr.Blocks(title="Polaris Tutor") as demo:
         "hypothesis_recorded": False,
         "resolved": False,
         "attempts_this_phase": 0,
+        "fallback_rung": 0,
         "structural_events": [],
     })
 
