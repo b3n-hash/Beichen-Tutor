@@ -58,7 +58,7 @@ Full design rationale, the five pedagogical rules, the Component/dependency-grap
 ## Setup
 
 ```bash
-git clone <TODO: repo URL>
+git clone https://github.com/b3n-hash/Beichen-Tutor.git
 cd polaris-tutor
 pip install -r requirements.txt
 ```
@@ -80,8 +80,6 @@ python app.py
 
 
 ---
-
-## Project Structure
 
 ## Team & Roles
 
@@ -107,7 +105,7 @@ python app.py
 
 ## Known Limitations
 
-- Open topic scope within Physical Geography means evidence-grounding (Layer 2) is the main outstanding technical risk — see `docs/AI_Tutor_Design_v2.md` for the tradeoff discussion.
+- Open topic scope within Physical Geography means evidence-grounding (Layer 2) is the main outstanding technical risk -vsee `docs/AI_Tutor_Design_v2.md` for the tradeoff discussion.
 - The Recursive Audit is itself an LLM call and may be lenient on subtle violations (e.g. confirmations phrased as encouragement) - spot-check logs by hand, don't treat the audit as ground truth.
 - `resolved` detection can silently miss a genuine resolution if the model confirms an answer without emitting the tag; a `[WATCH]` console log flags this for now (see `app.py`).
 
