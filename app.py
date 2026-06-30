@@ -50,6 +50,16 @@ PREMATURE_CONFIRM_RE = re.compile(
 
 FALLBACK_THRESHOLD = 3  # turns stuck in same phase before a [FALLBACK] event fires
 
+# Keys that must survive state reconstruction from a parsed STATE tag. These are
+# persistent runtime objects (not per-turn working values), so rebuilding state
+# must never drop them. Future Layer 2 additions extend this set rather than
+# copying keys ad hoc throughout respond().
+PERSISTENT_STATE_KEYS = {
+    "inquiry_session",
+    "incomplete_prompted_already",
+    "last_action",
+}
+
 # Hard guard: strip any fallback marker the model leaks into its visible reply.
 LEAKED_FALLBACK_RE = re.compile(r"\[EXHAUSTION FALLBACK[^\]]*\]\s*", re.IGNORECASE)
 
@@ -482,6 +492,7 @@ def _create_session(message, history, state):
     through to the normal respond() LLM call — either because the session was created
     successfully (state['inquiry_session'] is now set) or because decomposition failed
     and Layer 1 should handle the turn (session stays None)."""
+    print("[DEBUG] Origin Question Analysis invoked")
     qa = analyse_origin_question(
         message,
         incomplete_prompted_already=state.get("incomplete_prompted_already", False),
@@ -512,6 +523,7 @@ def _create_session(message, history, state):
     )
     session.derive_complexity()
     state["inquiry_session"] = session
+    print("[DEBUG] InquirySession created")
 
     log_structural(state, "L2-INIT", (
         f"Session created | complexity={session.complexity.value} | "
@@ -543,10 +555,12 @@ def handle_ready_button(history, state):
     return handle_ready_signal(history, state)
 
 
-def enforce_consistency(parsed: dict) -> dict:
-    """Validate the parsed state. Log a [VIOLATION] for impossible combinations
-    and sanitize resolved so it can never be trusted while the phase/hypothesis
-    preconditions are unmet. Expects parsed to already carry 'structural_events'."""
+def enforce_consistency(parsed: dict, previous_state: dict) -> dict:
+    """Validate the parsed state and rebuild the live state dict from it. Logs a
+    [VIOLATION] for impossible combinations, sanitizes resolved, and — centrally —
+    carries forward PERSISTENT_STATE_KEYS so reconstruction never drops the
+    InquirySession (or other persistent runtime objects). Expects parsed to already
+    carry 'structural_events'."""
     phase = parsed["phase"]
     recorded = parsed["hypothesis_recorded"]
     resolved = parsed["resolved"]
@@ -562,6 +576,16 @@ def enforce_consistency(parsed: dict) -> dict:
         resolved = False
 
     parsed["resolved"] = resolved
+
+    # Centralised persistence — the single place persistent objects survive a rebuild.
+    print(f"[DEBUG] InquirySession exists before reconstruction: "
+          f"{previous_state.get('inquiry_session') is not None}")
+    for key in PERSISTENT_STATE_KEYS:
+        if key in previous_state:
+            parsed[key] = previous_state[key]
+    print(f"[DEBUG] InquirySession exists after reconstruction: "
+          f"{parsed.get('inquiry_session') is not None}")
+
     return parsed
 
 
@@ -727,12 +751,14 @@ def respond(message, history, state):
         session.current_component.attempts += 1
 
     if parsed:
-        # Carry forward accumulated events and counters before state is replaced.
+        # Carry forward accumulated events and per-turn working counters; persistent
+        # runtime objects (inquiry_session, etc.) are handled centrally inside
+        # enforce_consistency via PERSISTENT_STATE_KEYS.
         parsed["structural_events"] = state.get("structural_events", [])
         parsed["attempts_this_phase"] = state.get("attempts_this_phase", 0)
         parsed["conclude_unresolved_streak"] = prev_unresolved_streak
         parsed["fallback_rung"] = fallback_rung  # incl. any surrender bump this turn
-        state = enforce_consistency(parsed)
+        state = enforce_consistency(parsed, state)
     state.setdefault("resolved", False)
     state.setdefault("structural_events", [])
     # Persist the working rung even when the model emitted no parseable STATE tag
