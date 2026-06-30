@@ -115,7 +115,10 @@ def gate_failed_check(actual, expected):
     return actual == expected, f"gate_failed == {expected!r}"
 
 
-hard_failures = 0
+hard_total = 0
+hard_pass = 0
+heuristic_pass = 0
+heuristic_warn = 0
 
 for i, case in enumerate(CASES, 1):
     result = analyse_origin_question(case["q"])
@@ -125,18 +128,26 @@ for i, case in enumerate(CASES, 1):
     print("  --- assertions ---")
     # Hard: valid (exact)
     ok = a.valid == case["valid"]
-    hard_failures += not ok
+    hard_total += 1
+    hard_pass += ok
     print(f"    [{'PASS' if ok else 'FAIL'}] (hard) valid == {case['valid']}")
 
     # Hard: gate_failed (exact or membership)
     ok, desc = gate_failed_check(a.gate_failed, case["gate_failed"])
-    hard_failures += not ok
+    hard_total += 1
+    hard_pass += ok
     print(f"    [{'PASS' if ok else 'FAIL'}] (hard) {desc}")
 
-    # Soft: model-judgement fields
+    # Heuristic: model-judgement fields
     for label, pred in case["soft"]:
         ok = pred(a)
-        print(f"    [{'PASS' if ok else 'WARN'}] (soft) {label}")
+        heuristic_pass += ok
+        heuristic_warn += not ok
+        print(f"    [{'PASS' if ok else 'WARN'}] Heuristic check: {label}")
 
-print(f"\nSUMMARY: {hard_failures} hard assertion(s) failed")
-sys.exit(1 if hard_failures else 0)
+print()
+print("===========================")
+print(f"Hard assertions: {hard_pass}/{hard_total} PASS")
+print(f"Heuristic checks: {heuristic_pass} PASS | {heuristic_warn} WARN")
+print("===========================")
+sys.exit(1 if hard_pass != hard_total else 0)
