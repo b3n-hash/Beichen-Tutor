@@ -11,6 +11,8 @@ import gradio as gr
 from openai import OpenAI
 
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, MODEL
+from layer2.action_prompts import build_injection
+from layer2.decision_policy import decide
 from layer2.models import Component, HypothesisStatus, InquirySession
 
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
@@ -411,8 +413,13 @@ def respond(message, history, state):
             continue  # UI-only greeting; never expose it to the LLM
         messages.append({"role": turn["role"], "content": turn["content"]})
 
-    # --- Inject the active fallback rung as a system-level instruction --------
-    if override_to_conclude:
+    # --- Action injection -----------------------------------------------------
+    # When a live Layer 2 session exists, the Decision Policy drives the injection.
+    # Otherwise fall back to the Layer 1 fallback ladder (state-dict driven).
+    if session is not None and session.required_components:
+        decision = decide(session)
+        messages.append({"role": "system", "content": build_injection(decision, session)})
+    elif override_to_conclude:
         messages.append({"role": "system", "content": OVERRIDE_TO_CONCLUDE_MSG})
     elif fallback_rung > 0 and prev_phase == "investigate":
         injection = FALLBACK_INJECTIONS[fallback_rung].format(n=state.get("attempts_this_phase", 0))

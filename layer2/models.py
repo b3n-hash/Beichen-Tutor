@@ -163,6 +163,7 @@ class InquirySession:
     complexity: Optional[Complexity] = None
     premise_under_investigation: bool = False   # True when question_class="false_premise";
     # tutor addresses the premise before the main inquiry
+    fallback_rung: int = 0                       # 0 = no fallback active; 1–4 = current rung
 
     @property
     def current_component(self) -> Optional[Component]:
