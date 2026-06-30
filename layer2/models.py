@@ -50,6 +50,10 @@ class GateFailure(str, Enum):
     INCOMPLETE = "incomplete"
     OUT_OF_SCOPE = "out_of_scope"
     NOT_DECOMPOSABLE = "not_decomposable"
+    # question_class values that also short-circuit the gate sequence as failures
+    SUBJECTIVE = "subjective"
+    UNANSWERABLE = "unanswerable"
+    AMBIGUOUS = "ambiguous"
 
 
 class PriorKnowledge(str, Enum):
