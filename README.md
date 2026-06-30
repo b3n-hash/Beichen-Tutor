@@ -8,6 +8,8 @@ Built for **CCNU Project 7 - AI Tutoring System**
 
 The AI Tutor never answers a Learner's question directly. It guides them through a structured inquiry cycle — eliciting a hypothesis, investigating it through evidence and questioning, and only letting the Learner state the conclusion themselves — enforced by a pedagogical state machine rather than left to the model's own judgement.
 
+Within the context of this program, the "North Star" is then defined as the Target Conclusion the AI Tutor guides the Learner towards.
+
 ---
 
 ## Topic & Strategy
