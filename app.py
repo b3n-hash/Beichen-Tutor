@@ -329,23 +329,34 @@ def apply_component_update(session: InquirySession, tag: ParsedComponentTag, log
 
     component = session.required_components[tag.component_id]
 
+    log_fn("L2-SCORE", (
+        f"id={component.id} '{component.concept}' "
+        f"before M={component.mastery:.2f} G={component.groundedness:.2f} | "
+        f"incoming M={tag.mastery:.2f} G={tag.groundedness:.2f}"
+    ))
+
     # 4. Update scores.
     component.mastery = tag.mastery
     component.groundedness = tag.groundedness
+
+    log_fn("L2-SCORE", f"id={component.id} after M={component.mastery:.2f} G={component.groundedness:.2f}")
 
     # 5. Update hypothesis status if supplied (coerced to the enum for consistency
     # with record_hypothesis; the regex already restricts it to valid values).
     if tag.hypothesis_status is not None:
         session.hypothesis_status = HypothesisStatus(tag.hypothesis_status)
+        log_fn("L2-HYP-STATUS", f"status={session.hypothesis_status.value} (via COMPONENT tag)")
 
     # 6. One-way latch; log the transition.
     if component.mark_covered():
+        log_fn("L2-COVERED", f"id={component.id} '{component.concept}'")
         log_fn("INFO", f"component '{component.concept}' marked covered "
                        f"(mastery={component.mastery:.2f}, groundedness={component.groundedness:.2f})")
 
     # 7. Advance off a covered current component.
     if component.covered and session.current_component is component:
         session.advance_component()
+        log_fn("L2-ADVANCE", f"current_component={session.current_component_index}")
         return True
     return False
 
@@ -365,6 +376,44 @@ def _format_current_component(component: Component) -> str:
     if component.confidence is not None:
         lines.append(f"confidence: {component.confidence:.2f}")
     return "\n".join(lines)
+
+
+# Conversational control messages that are never a hypothesis on their own.
+_NON_HYPOTHESIS_MESSAGES = {
+    "yes", "no", "ok", "okay", "sure", "continue", "go ahead", "try again", "next",
+    "answer now", "i don't know", "dont know", "idk", "i'm ready", "im ready",
+}
+
+
+def is_substantive_hypothesis(message: str) -> bool:
+    """True if the message is a real explanatory statement rather than a
+    conversational control message. Short answers (e.g. 'Because inertia.') are
+    accepted; acknowledgements/commands ('Yes', 'Go ahead', "I don't know") are not."""
+    normalised = (message or "").strip().lower().rstrip(".!?")
+    if not normalised:
+        return False
+    return normalised not in _NON_HYPOTHESIS_MESSAGES
+
+
+def _maybe_record_hypothesis(session: InquirySession, message, history, state) -> None:
+    """Append the learner's current hypothesis to session.hypothesis_history when it
+    is substantive and not an exact consecutive duplicate (text AND status unchanged).
+    Records the initial hypothesis and each subsequent revision or status change —
+    never overwriting prior entries."""
+    text = (message or "").strip()
+    if not is_substantive_hypothesis(text):
+        return
+
+    status = session.hypothesis_status
+    last = session.hypothesis_history[-1] if session.hypothesis_history else None
+    if last is not None and last[0] == text and last[1] == status:
+        return  # identical consecutive hypothesis — do nothing
+
+    # Turn number = the AI Tutor turn responding this turn (the greeting is turn 1).
+    turn_no = sum(1 for t in history if t.get("role") == "assistant") + 1
+    session.record_hypothesis(text=text, status=status, turn=turn_no)
+    status_v = status.value if hasattr(status, "value") else status
+    log_structural(state, "L2-HYPOTHESIS", f"turn={turn_no} status={status_v} text='{text[:80]}'")
 
 
 # --- Learner conclude signal (Layer 2) ----------------------------------------
@@ -492,7 +541,6 @@ def _create_session(message, history, state):
     through to the normal respond() LLM call — either because the session was created
     successfully (state['inquiry_session'] is now set) or because decomposition failed
     and Layer 1 should handle the turn (session stays None)."""
-    print("[DEBUG] Origin Question Analysis invoked")
     qa = analyse_origin_question(
         message,
         incomplete_prompted_already=state.get("incomplete_prompted_already", False),
@@ -523,7 +571,6 @@ def _create_session(message, history, state):
     )
     session.derive_complexity()
     state["inquiry_session"] = session
-    print("[DEBUG] InquirySession created")
 
     log_structural(state, "L2-INIT", (
         f"Session created | complexity={session.complexity.value} | "
@@ -578,13 +625,9 @@ def enforce_consistency(parsed: dict, previous_state: dict) -> dict:
     parsed["resolved"] = resolved
 
     # Centralised persistence — the single place persistent objects survive a rebuild.
-    print(f"[DEBUG] InquirySession exists before reconstruction: "
-          f"{previous_state.get('inquiry_session') is not None}")
     for key in PERSISTENT_STATE_KEYS:
         if key in previous_state:
             parsed[key] = previous_state[key]
-    print(f"[DEBUG] InquirySession exists after reconstruction: "
-          f"{parsed.get('inquiry_session') is not None}")
 
     return parsed
 
@@ -675,6 +718,15 @@ def respond(message, history, state):
     if session is not None:
         decision = decide(session)
         log_structural(state, "DECISION", str(decision))
+        cc = session.current_component
+        if cc is not None:
+            log_structural(state, "L2-DP", (
+                f"component={session.current_component_index} '{cc.concept}' "
+                f"M={cc.mastery:.2f} G={cc.groundedness:.2f} "
+                f"covered={cc.covered} attempts={cc.attempts}"
+            ))
+        else:
+            log_structural(state, "L2-DP", f"component={session.current_component_index} (none — all covered)")
         state["last_action"] = decision.action
         messages.append({"role": "system", "content": build_injection(decision, session)})
     elif override_to_conclude:
@@ -764,6 +816,12 @@ def respond(message, history, state):
     # Persist the working rung even when the model emitted no parseable STATE tag
     # (parsed is None) — otherwise a surrender bump is silently dropped.
     state["fallback_rung"] = fallback_rung
+
+    # --- Record the learner's hypothesis into the live session (Layer 2) -------
+    # session.hypothesis_status was just updated by apply_component_update; pair it
+    # with the learner's own words to build a chronological hypothesis_history.
+    if session is not None and state.get("hypothesis_recorded"):
+        _maybe_record_hypothesis(session, message, history, state)
 
     # --- attempts_this_phase counter ------------------------------------------
     new_phase = state["phase"]
