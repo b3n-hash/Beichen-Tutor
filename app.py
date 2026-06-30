@@ -88,6 +88,22 @@ STATE_REPAIR_MSG = (
     "own first line, then a newline, then the reply text."
 )
 
+# Static greeting shown as the first assistant turn every session. UI-only —
+# filtered out of the history before it is ever sent to the LLM.
+GREETING_MSG = {
+    "role": "assistant",
+    "content": (
+        "Hi, I'm Běichén 北辰 — an inquiry-based learning tutor for **physical geography**.\n\n"
+        "I'm designed for questions about *why* and *how* geographical phenomena work — "
+        "things like erosion, plate tectonics, weather systems, coastal formation, and river "
+        "behaviour. Questions that have a causal mechanism worth exploring.\n\n"
+        "A good example: **\"Why do rivers meander?\"** or **\"How do glaciers shape valleys?\"**\n\n"
+        "I'm not designed for factual lookups like \"Where is Paris?\" or \"How tall is Everest?\" "
+        "— those have a single answer, not a mechanism to investigate.\n\n"
+        "Ask me a physical geography question and we'll work through it together."
+    )
+}
+
 SYSTEM_PROMPT = """You are an Inquiry-Based Learning tutor for Physical Geography. You never simply answer the
 Learner's question. You guide them through a three-Phase loop:
 
@@ -249,6 +265,8 @@ def respond(message, history, state):
             ),
         })
     for turn in history:
+        if turn["content"] == GREETING_MSG["content"]:
+            continue  # UI-only greeting; never expose it to the LLM
         messages.append({"role": turn["role"], "content": turn["content"]})
 
     # --- Inject the active fallback rung as a system-level instruction --------
@@ -656,10 +674,12 @@ def reset_for_new_query(history, state):
     session, then clear history and state for a fresh inquiry. A failed profile
     call must never block the reset."""
     state = state or {}
+    # Drop the UI-only greeting so it never pollutes the profile transcript.
+    session_history = [t for t in (history or []) if t["content"] != GREETING_MSG["content"]]
     # Gate (caller half): only profile sessions where a hypothesis was recorded.
     if state.get("hypothesis_recorded"):
         try:
-            updated = generate_learner_profile(history or [], load_learner_profile())
+            updated = generate_learner_profile(session_history, load_learner_profile())
             if updated:
                 save_learner_profile(updated)
                 global LEARNER_PROFILE
@@ -675,7 +695,7 @@ def reset_for_new_query(history, state):
         "fallback_rung": 0,
         "structural_events": [],
     }
-    return [], fresh_state, format_phase_label(fresh_state), "", ""
+    return [GREETING_MSG], fresh_state, format_phase_label(fresh_state), "", ""
 
 
 # Gradio 4.44.1 gr.Chatbot has no `autoscroll` param, so observe the DOM and
@@ -698,7 +718,7 @@ AUTOSCROLL_JS = """
 with gr.Blocks(title="Polaris Tutor") as demo:
     gr.Markdown("# Polaris Tutor — Inquiry-Based Geography Tutor (Layer 1)")
     phase_display = gr.Markdown("**Phase:** ask · **Hypothesis recorded:** False · **Resolved:** False")
-    chatbot = gr.Chatbot(type="messages", height=480, elem_id="polaris-chatbot")
+    chatbot = gr.Chatbot(type="messages", value=[GREETING_MSG], height=480, elem_id="polaris-chatbot")
     with gr.Row():
         msg = gr.Textbox(
             label="Your message",
