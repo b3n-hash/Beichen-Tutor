@@ -12,9 +12,15 @@ from openai import OpenAI
 
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, MODEL
 from layer2.action_prompts import build_injection
-from layer2.decision_policy import decide
+from layer2.decision_policy import decide, decide_readiness
 from layer2.fallback_prompts import FALLBACK_INJECTIONS
-from layer2.models import Component, HypothesisStatus, InquirySession
+from layer2.models import (
+    Component,
+    HypothesisStatus,
+    InquirySession,
+    LearnerIntent,
+    ReadinessStatus,
+)
 
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
@@ -53,6 +59,31 @@ SURRENDER_RE = re.compile(
     r"\b(just\s+)?(tell|give)\s+me\s+(the\s+)?answer\b"
     r"|\bwhat\s+is\s+the\s+answer\b"
     r"|\bjust\s+tell\s+me\b",
+    re.IGNORECASE,
+)
+
+# Learner-initiated conclude signal (Trigger B). Future work: consolidate with
+# SURRENDER_RE and the override check into layer2/intent_detection.py.
+READY_TO_CONCLUDE_RE = re.compile(
+    r"\bi'?m\s+ready(\s+to\s+(conclude|answer|try))?\b"
+    r"|\bi\s+think\s+i\s+(know|get\s+it|understand(\s+now)?)\b"
+    r"|\bcan\s+i\s+(try|answer(\s+now)?)\b"
+    r"|\blet\s+me\s+try(\s+to\s+answer)?\b"
+    r"|\bi\s+(want|'?d\s+like)\s+to\s+(try|conclude|answer)\b"
+    r"|\bi'?ve\s+got\s+it\b"
+    r"|\bi'?m\s+good\b"
+    r"|\blet'?s\s+answer\b",
+    re.IGNORECASE,
+)
+
+# "Go ahead" override signal used for the PARTIAL follow-up (also lexical for now).
+GO_AHEAD_RE = re.compile(
+    r"\b(yes|yeah|yep|yup|sure|ok(ay)?)\b"
+    r"|\bgo\s+ahead\b|\bgo\s+for\s+it\b"
+    r"|\b(just\s+)?let\s+me\s+try\b"
+    r"|\blet'?s\s+do\s+it\b"
+    r"|\bnow\b"
+    r"|\bi'?m\s+ready\b",
     re.IGNORECASE,
 )
 
@@ -318,6 +349,125 @@ def _format_current_component(component: Component) -> str:
     return "\n".join(lines)
 
 
+# --- Learner conclude signal (Layer 2) ----------------------------------------
+
+def _readiness_injection(rd, session: InquirySession) -> str:
+    """Build the system injection for a conclude signal based on tutor readiness."""
+    if rd.status == ReadinessStatus.READY:
+        return (
+            "[LEARNER INTENT: CONCLUDE — TUTOR ESTIMATE: READY]\n"
+            "All components are covered. Transition to CONCLUDE: invite the learner to state their answer "
+            "to the original question."
+        )
+    if rd.status == ReadinessStatus.PARTIAL:
+        n = len(rd.uncovered)
+        concepts = ", ".join(c.concept for c in rd.uncovered)
+        next_concept = rd.uncovered[0].concept
+        return (
+            f"[LEARNER INTENT: CONCLUDE — TUTOR ESTIMATE: PARTIAL ({n} component(s) remaining)]\n"
+            f"Uncovered: {concepts}\n"
+            "Acknowledge their readiness signal. Tell them one concept hasn't been fully explored.\n"
+            f"Offer a genuine choice: \"We could explore {next_concept} first, or you're welcome to try now "
+            "— it's your call.\""
+        )
+    # EARLY
+    return (
+        "[LEARNER INTENT: CONCLUDE — TUTOR ESTIMATE: TOO EARLY]\n"
+        "No components have been covered yet.\n"
+        "Acknowledge their enthusiasm. Redirect collaboratively — something like: \"I think we'd both have a "
+        "stronger answer if we explored one or two ideas first.\" Return to the current inquiry."
+    )
+
+
+def _override_injection(session: InquirySession) -> str:
+    """Injection used when the learner overrides a PARTIAL estimate to conclude anyway."""
+    by_id = {c.id: c.concept for c in session.required_components}
+    skipped_names = [by_id.get(cid, str(cid)) for cid in session.skipped_component_ids]
+    return (
+        "[LEARNER OVERRIDE — CONCLUDING WITH GAPS]\n"
+        "The learner has chosen to conclude.\n"
+        f"Skipped concepts: {', '.join(skipped_names)}\n"
+        "Transition to CONCLUDE now. After they answer, you may naturally draw on skipped concepts — "
+        "e.g. \"How might {concept} affect your explanation?\" Do not lecture them about gaps before they answer."
+    )
+
+
+def _signal_turn(history, state, session, injection, user_message):
+    """Run a single injected LLM turn for a conclude signal (button or lexical).
+    Mirrors respond()'s message assembly but with a fixed Layer 2 injection."""
+    history = history or []
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if LEARNER_PROFILE:
+        messages.append({
+            "role": "system",
+            "content": (
+                f"[LEARNER PROFILE — prior session observations] {LEARNER_PROFILE}\n"
+                "Treat these as observed tendencies, not fixed constraints. Adjust your approach if this "
+                "session suggests the learner's behaviour differs."
+            ),
+        })
+    if session is not None and session.current_component is not None:
+        messages.append({"role": "system", "content": _format_current_component(session.current_component)})
+    for turn in history:
+        if turn["content"] == GREETING_MSG["content"]:
+            continue
+        messages.append({"role": turn["role"], "content": turn["content"]})
+    messages.append({"role": "system", "content": injection})
+    messages.append({"role": "system", "content": STATE_REMINDER})
+    messages.append({"role": "user", "content": user_message})
+
+    raw_reply = call_model(messages, state, "conclude-signal turn")
+    if raw_reply is None:
+        gr.Warning("The tutor is temporarily unavailable (model call failed). Please try again.")
+        history = history + [
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": "⚠️ The tutor is temporarily unavailable. Please try again."},
+        ]
+        return history, state, format_phase_label(state), "", ""
+
+    visible_reply, state_tag, component_tag = parse_state(raw_reply)
+    if visible_reply and LEAKED_FALLBACK_RE.search(visible_reply):
+        visible_reply = LEAKED_FALLBACK_RE.sub("", visible_reply).strip()
+    if not visible_reply:
+        visible_reply = "(The model returned no response. Please try again.)"
+
+    if component_tag is not None and session is not None:
+        apply_component_update(session, component_tag, partial(log_structural, state))
+    if state_tag is not None and isinstance(state, dict):
+        state["phase"] = state_tag.phase
+        state["hypothesis_recorded"] = state_tag.hypothesis_recorded
+        state["resolved"] = state_tag.resolved
+
+    history = history + [
+        {"role": "user", "content": user_message},
+        {"role": "assistant", "content": visible_reply},
+    ]
+    return history, state, format_phase_label(state), "", ""
+
+
+def _conclude_signal_flow(history, state, session, user_message):
+    """Set the conclude intent, decide readiness, and run the injected turn.
+    Clears pending_intent for READY/EARLY; leaves it set for PARTIAL (learner has
+    not yet chosen)."""
+    session.pending_intent = LearnerIntent.CONCLUDE
+    rd = decide_readiness(session)
+    injection = _readiness_injection(rd, session)
+    if rd.status in (ReadinessStatus.READY, ReadinessStatus.EARLY):
+        session.pending_intent = None
+    return _signal_turn(history, state, session, injection, user_message)
+
+
+def handle_ready_signal(history, state):
+    """Button (Trigger A) handler for the learner conclude signal.
+    No-op if no active InquirySession exists — Prompt 7 owns session creation."""
+    history = history or []
+    session = state.get("inquiry_session") if isinstance(state, dict) else None
+    if session is None:
+        return history, state, format_phase_label(state), "", ""
+    return _conclude_signal_flow(history, state, session, "I'd like to try answering now.")
+
+
 def enforce_consistency(parsed: dict) -> dict:
     """Validate the parsed state. Log a [VIOLATION] for impossible combinations
     and sanitize resolved so it can never be trusted while the phase/hypothesis
@@ -356,6 +506,21 @@ def respond(message, history, state):
 
     # Optional Layer 2 session (absent until the inquiry pipeline is wired in).
     session = state.get("inquiry_session") if isinstance(state, dict) else None
+
+    # --- Learner conclude signal (Layer 2; only when a live session exists) ----
+    if session is not None:
+        # PARTIAL follow-up: a pending conclude intent awaiting the learner's choice.
+        if session.pending_intent == LearnerIntent.CONCLUDE:
+            if GO_AHEAD_RE.search(message):
+                rd = decide_readiness(session)
+                session.skipped_component_ids = [c.id for c in rd.uncovered]
+                session.pending_intent = None
+                return _signal_turn(history, state, session, _override_injection(session), message)
+            # Chose to continue exploring — clear intent and fall through to normal routing.
+            session.pending_intent = None
+        # Fresh lexical conclude signal (Trigger B), checked before the LLM call.
+        elif READY_TO_CONCLUDE_RE.search(message):
+            return _conclude_signal_flow(history, state, session, message)
 
     # --- Surrender detection (accelerates the Fallback ladder) ----------------
     # Working rung carried in from prior turns; surrender can bump it this turn.
@@ -863,6 +1028,7 @@ with gr.Blocks(title="Polaris Tutor") as demo:
         )
         export_btn = gr.Button("Export Session", scale=1)
         new_query_btn = gr.Button("New Query", scale=1)
+        ready_btn = gr.Button("I'm Ready to Conclude", scale=1)
     export_status = gr.Markdown("")
     state = gr.State({
         "phase": "ask",
@@ -879,6 +1045,11 @@ with gr.Blocks(title="Polaris Tutor") as demo:
         reset_for_new_query,
         [chatbot, state],
         [chatbot, state, phase_display, export_status, msg],
+    )
+    ready_btn.click(
+        handle_ready_signal,
+        [chatbot, state],
+        [chatbot, state, phase_display, msg, export_status],
     )
 
     demo.load(None, None, None, js=AUTOSCROLL_JS)

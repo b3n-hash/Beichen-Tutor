@@ -82,6 +82,19 @@ class Complexity(str, Enum):
     HIGH = "high"
 
 
+class ReadinessStatus(str, Enum):
+    READY = "ready"
+    PARTIAL = "partial"
+    EARLY = "early"
+
+
+class LearnerIntent(str, Enum):
+    CONCLUDE = "conclude"
+    SURRENDER = "surrender"   # reserved — future unification with Layer 1
+    TANGENT = "tangent"       # reserved
+    CONTINUE = "continue"     # default
+
+
 # --- Question analysis --------------------------------------------------------
 
 @dataclass
@@ -164,6 +177,11 @@ class InquirySession:
     premise_under_investigation: bool = False   # True when question_class="false_premise";
     # tutor addresses the premise before the main inquiry
     fallback_rung: int = 0                       # 0 = no fallback active; 1–4 = current rung
+    pending_intent: Optional[LearnerIntent] = None
+    skipped_component_ids: list[int] = field(default_factory=list)
+    # stores component IDs (stable integer indices) of uncovered components when the
+    # learner concludes early; resolved to names when building prompts. Set on PARTIAL
+    # override; cleared after post-conclusion feedback; never carried into a new session.
 
     @property
     def current_component(self) -> Optional[Component]:

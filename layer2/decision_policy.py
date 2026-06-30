@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from layer2.models import HypothesisStatus, InquirySession
+from layer2.models import Component, HypothesisStatus, InquirySession, ReadinessStatus
 
 # --- Action constants ---------------------------------------------------------
 ACTION_INQUIRY = "inquiry"
@@ -37,6 +37,27 @@ class PolicyDecision:
     def __str__(self) -> str:
         rung = f" rung={self.rung}" if self.action == ACTION_FALLBACK else ""
         return f"PolicyDecision({self.action}{rung}, confidence={self.confidence:.2f}, reason={self.reason!r})"
+
+
+@dataclass
+class ReadinessDecision:
+    status: ReadinessStatus
+    uncovered: list[Component]   # empty if status == READY
+
+
+def decide_readiness(session: InquirySession) -> ReadinessDecision:
+    """Pure function. Does not mutate session.
+
+    If decomposition has not yet run (no components), treat as EARLY."""
+    if not session.required_components:
+        return ReadinessDecision(status=ReadinessStatus.EARLY, uncovered=[])
+
+    uncovered = [c for c in session.required_components if not c.covered]
+    if len(uncovered) == 0:
+        return ReadinessDecision(status=ReadinessStatus.READY, uncovered=[])
+    if len(uncovered) == len(session.required_components):
+        return ReadinessDecision(status=ReadinessStatus.EARLY, uncovered=uncovered)
+    return ReadinessDecision(status=ReadinessStatus.PARTIAL, uncovered=uncovered)
 
 
 def decide(session: InquirySession) -> PolicyDecision:
