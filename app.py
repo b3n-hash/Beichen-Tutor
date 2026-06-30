@@ -12,15 +12,18 @@ from openai import OpenAI
 
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, MODEL
 from layer2.action_prompts import build_injection
+from layer2.conclusion_decomp import run_decomposition
 from layer2.decision_policy import decide, decide_readiness
 from layer2.fallback_prompts import FALLBACK_INJECTIONS
 from layer2.models import (
     Component,
+    GateFailure,
     HypothesisStatus,
     InquirySession,
     LearnerIntent,
     ReadinessStatus,
 )
+from layer2.question_analysis import analyse_origin_question
 
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
@@ -290,26 +293,27 @@ def _state_tag_to_dict(state_tag: ParsedStateTag | None) -> dict | None:
     }
 
 
-def apply_component_update(session: InquirySession, tag: ParsedComponentTag, log_fn) -> None:
+def apply_component_update(session: InquirySession, tag: ParsedComponentTag, log_fn) -> bool:
     """Apply a parsed COMPONENT tag to the live Component in the session.
-    Validation failures emit a [WATCH] via log_fn and abort the update (no clamping)."""
+    Validation failures emit a [WATCH] via log_fn and abort the update (no clamping).
+    Returns True if the session advanced off a covered component, else False."""
     # 1. Range validation — never clamp; an out-of-range value signals a prompt bug.
     if not (0.0 <= tag.mastery <= 1.0 and 0.0 <= tag.groundedness <= 1.0):
         log_fn("WATCH", f"COMPONENT tag out of range (mastery={tag.mastery}, "
                         f"groundedness={tag.groundedness}) — ignoring update")
-        return
+        return False
 
     # 2. Bounds check on the component id.
     if not (0 <= tag.component_id < len(session.required_components)):
         log_fn("WATCH", f"COMPONENT tag id={tag.component_id} out of range "
                         f"(have {len(session.required_components)} components) — ignoring")
-        return
+        return False
 
     # 3. Must match the component currently being taught.
     if tag.component_id != session.current_component_index:
         log_fn("WATCH", f"COMPONENT tag id={tag.component_id} does not match current "
                         f"component {session.current_component_index} — ignoring")
-        return
+        return False
 
     component = session.required_components[tag.component_id]
 
@@ -330,6 +334,8 @@ def apply_component_update(session: InquirySession, tag: ParsedComponentTag, log
     # 7. Advance off a covered current component.
     if component.covered and session.current_component is component:
         session.advance_component()
+        return True
+    return False
 
 
 def _format_current_component(component: Component) -> str:
@@ -468,6 +474,67 @@ def handle_ready_signal(history, state):
     return _conclude_signal_flow(history, state, session, "I'd like to try answering now.")
 
 
+def _create_session(message, history, state):
+    """First-message Layer 2 setup, run synchronously. Returns a 5-tuple ONLY to
+    short-circuit respond() with a redirect (invalid question). Returns None to fall
+    through to the normal respond() LLM call — either because the session was created
+    successfully (state['inquiry_session'] is now set) or because decomposition failed
+    and Layer 1 should handle the turn (session stays None)."""
+    qa = analyse_origin_question(
+        message,
+        incomplete_prompted_already=state.get("incomplete_prompted_already", False),
+    ).analysis
+
+    if not qa.valid:
+        if qa.gate_failed == GateFailure.INCOMPLETE:
+            state["incomplete_prompted_already"] = True
+        redirect = qa.redirect_response or "Could you rephrase that as a physical-geography question?"
+        new_history = history + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": redirect},
+        ]
+        return new_history, state, format_phase_label(state), "", ""
+
+    # Valid — decompose synchronously (one or two API calls, < ~1s total).
+    try:
+        result = run_decomposition(message, qa)
+    except Exception as exc:  # degrade to Layer 1, never raise
+        log_structural(state, "WATCH", f"Layer 2 decomposition failed: {exc}")
+        return None
+
+    session = InquirySession(
+        topic_anchor=message,
+        question_analysis=qa,
+        target_conclusion=result.target_conclusion,
+        required_components=result.required_components,
+    )
+    session.derive_complexity()
+    state["inquiry_session"] = session
+
+    # Session is set in state — fall through so respond() continues to the LLM call
+    # and generates the tutor's first question in response to the learner's question.
+    return None
+
+
+def handle_ready_button(history, state):
+    """Guarded entry point for the 'I'm Ready to Conclude' button. Shows a Gradio
+    popup and no-ops if a guard fails; otherwise delegates to handle_ready_signal."""
+    history = history or []
+    session = state.get("inquiry_session") if isinstance(state, dict) else None
+
+    if session is None:
+        gr.Warning("Ask a question first to start a session.")
+        return history, state, format_phase_label(state), "", ""
+    if state.get("phase") == "conclude":
+        gr.Warning("You're already in the conclusion phase.")
+        return history, state, format_phase_label(state), "", ""
+    if session.hypothesis_status == HypothesisStatus.UNCLASSIFIED:
+        gr.Warning("Share your initial thinking first — what do you think is happening? — before trying to conclude.")
+        return history, state, format_phase_label(state), "", ""
+
+    return handle_ready_signal(history, state)
+
+
 def enforce_consistency(parsed: dict) -> dict:
     """Validate the parsed state. Log a [VIOLATION] for impossible combinations
     and sanitize resolved so it can never be trusted while the phase/hypothesis
@@ -499,13 +566,27 @@ def respond(message, history, state):
         "attempts_this_phase": 0,
         "fallback_rung": 0,
         "structural_events": [],
+        "inquiry_session": None,              # InquirySession | None
+        "incomplete_prompted_already": False, # True after first incomplete prompt
     }
     prev_resolved = bool(state.get("resolved", False))
     prev_phase = state.get("phase", "ask")
     prev_unresolved_streak = state.get("conclude_unresolved_streak", 0)
 
-    # Optional Layer 2 session (absent until the inquiry pipeline is wired in).
+    # Optional Layer 2 session (created lazily on the first valid origin question).
     session = state.get("inquiry_session") if isinstance(state, dict) else None
+
+    # --- Layer 2 session creation (first message only, synchronous) ------------
+    # Detect the first real message: no session yet and no prior learner turns.
+    # (history is not empty on the first turn because it carries the UI greeting.)
+    first_message = session is None and not any(t.get("role") == "user" for t in history)
+    if first_message and isinstance(state, dict):
+        created = _create_session(message, history, state)
+        if created is not None:
+            return created  # redirect only (invalid question)
+        # Otherwise fall through to the normal LLM call. session is now set on
+        # success, or still None if decomposition failed (Layer 1 handles it).
+        session = state.get("inquiry_session")
 
     # --- Learner conclude signal (Layer 2; only when a live session exists) ----
     if session is not None:
@@ -555,10 +636,13 @@ def respond(message, history, state):
         messages.append({"role": turn["role"], "content": turn["content"]})
 
     # --- Action injection -----------------------------------------------------
-    # When a live Layer 2 session exists, the Decision Policy drives the injection.
-    # Otherwise fall back to the Layer 1 fallback ladder (state-dict driven).
-    if session is not None and session.required_components:
+    # When a live Layer 2 session exists, the Decision Policy drives the injection
+    # (computed from session state entering this turn). Otherwise fall back to the
+    # Layer 1 fallback ladder (state-dict driven).
+    if session is not None:
         decision = decide(session)
+        log_structural(state, "DECISION", str(decision))
+        state["last_action"] = decision.action
         messages.append({"role": "system", "content": build_injection(decision, session)})
     elif override_to_conclude:
         messages.append({"role": "system", "content": OVERRIDE_TO_CONCLUDE_MSG})
@@ -624,9 +708,14 @@ def respond(message, history, state):
         visible_reply = LEAKED_FALLBACK_RE.sub("", visible_reply).strip()
 
     # Apply the COMPONENT score update (Layer 2). respond() holds no update logic
-    # itself — it delegates to apply_component_update.
+    # itself — it delegates to apply_component_update. Increment attempts on the
+    # current component unless the update advanced past it (caller decides via the
+    # returned bool, not by comparing indices).
+    component_advanced = False
     if component_tag is not None and session is not None:
-        apply_component_update(session, component_tag, partial(log_structural, state))
+        component_advanced = apply_component_update(session, component_tag, partial(log_structural, state))
+    if session is not None and session.current_component is not None and not component_advanced:
+        session.current_component.attempts += 1
 
     if parsed:
         # Carry forward accumulated events and counters before state is replaced.
@@ -822,6 +911,60 @@ Then exactly these three markdown subheadings, in this order, matching the regis
     return trajectory, body
 
 
+def _format_layer2_section(session: InquirySession) -> str:
+    """Render the '## Layer 2 — Session State' export block from a live session."""
+    def val(x, default="—"):
+        if x is None:
+            return default
+        return x.value if hasattr(x, "value") else x
+
+    qa = session.question_analysis
+    qclass = val(qa.question_class) if qa else "—"
+    qtype = val(qa.question_type) if qa else "—"
+    operative = (qa.operative if qa and qa.operative else "—")
+    prior_knowledge = val(qa.prior_knowledge_level) if qa else "—"
+    complexity = val(session.complexity)
+
+    rows = [
+        "| # | Concept | Mastery | Groundedness | Covered | Attempts |",
+        "|---|---|---|---|---|---|",
+    ]
+    for c in session.required_components:
+        covered = "✓" if c.covered else "—"
+        rows.append(f"| {c.id} | {c.concept} | {c.mastery:.2f} | {c.groundedness:.2f} | {covered} | {c.attempts} |")
+    table = "\n".join(rows)
+
+    readiness = decide_readiness(session).status.value
+
+    by_id = {c.id: c.concept for c in session.required_components}
+    skipped_names = [by_id.get(cid, str(cid)) for cid in session.skipped_component_ids]
+    skipped_str = ", ".join(skipped_names) if skipped_names else "none"
+
+    if session.hypothesis_history:
+        hyp_lines = []
+        for entry in session.hypothesis_history:
+            text, status, turn = entry[0], entry[1], entry[2]
+            status_v = status.value if hasattr(status, "value") else status
+            hyp_lines.append(f'- Turn {turn}: "{text}" [{status_v}]')
+        hyp_block = "\n".join(hyp_lines)
+    else:
+        hyp_block = "_(none recorded)_"
+
+    return (
+        "## Layer 2 — Session State\n\n"
+        f"**Question class:** {qclass}\n"
+        f"**Question type:** {qtype}\n"
+        f"**Operative:** {operative}\n"
+        f"**Prior knowledge level:** {prior_knowledge}\n"
+        f"**Complexity:** {complexity}\n\n"
+        f"**Components:**\n\n{table}\n\n"
+        f"**Readiness:** {readiness}\n"
+        f"**Fallback rung at close:** {session.fallback_rung}\n"
+        f"**Skipped components:** {skipped_str}\n\n"
+        f"**Hypothesis history:**\n{hyp_block}\n"
+    )
+
+
 def export_markdown(history, state):
     """Write a full Markdown session log (transcript + auto evaluation) to logs/.
     Returns the path written, or None if it could not be produced."""
@@ -855,6 +998,12 @@ def export_markdown(history, state):
         else "_(none detected)_"
     )
 
+    # Layer 2 session block — only when a live session exists.
+    layer2_session = state.get("inquiry_session") if isinstance(state, dict) else None
+    layer2_block = ""
+    if layer2_session is not None:
+        layer2_block = f"{_format_layer2_section(layer2_session)}\n---\n\n"
+
     document = (
         f"# Session Log\n\n"
         f"**Origin Question:** {origin}\n"
@@ -867,6 +1016,7 @@ def export_markdown(history, state):
         f"## Structural Checks (non-LLM)\n\n"
         f"{structural_section}\n\n"
         f"---\n\n"
+        f"{layer2_block}"
         f"## Evaluation\n\n"
         f"{evaluation}\n"
     )
@@ -1037,6 +1187,8 @@ with gr.Blocks(title="Polaris Tutor") as demo:
         "attempts_this_phase": 0,
         "fallback_rung": 0,
         "structural_events": [],
+        "inquiry_session": None,
+        "incomplete_prompted_already": False,
     })
 
     msg.submit(respond, [msg, chatbot, state], [chatbot, state, phase_display, msg, export_status])
@@ -1047,7 +1199,7 @@ with gr.Blocks(title="Polaris Tutor") as demo:
         [chatbot, state, phase_display, export_status, msg],
     )
     ready_btn.click(
-        handle_ready_signal,
+        handle_ready_button,
         [chatbot, state],
         [chatbot, state, phase_display, msg, export_status],
     )
