@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
@@ -24,6 +25,7 @@ from layer2.models import (
     ReadinessStatus,
 )
 from layer2.question_analysis import analyse_origin_question
+from utils.performance_logger import PerformanceLogger
 
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
@@ -58,6 +60,7 @@ PERSISTENT_STATE_KEYS = {
     "inquiry_session",
     "incomplete_prompted_already",
     "last_action",
+    "performance_logger",
 }
 
 # Hard guard: strip any fallback marker the model leaks into its visible reply.
@@ -222,16 +225,46 @@ def log_structural(state: dict, tag: str, message: str) -> None:
     print(entry)
 
 
+def get_perf(state):
+    """Fetch (or lazily create) the per-session PerformanceLogger, binding its
+    [PERF] structural emission to the current state."""
+    if not isinstance(state, dict):
+        return None
+    perf = state.get("performance_logger")
+    if perf is None:
+        perf = PerformanceLogger()
+        state["performance_logger"] = perf
+    perf._log_fn = partial(log_structural, state)
+    return perf
+
+
 def call_model(messages, state, what="model call"):
     """Single chat completion with error capture. Returns the content string, or
     None on failure (logged as a structural [WATCH] so the turn can degrade
-    gracefully instead of crashing)."""
+    gracefully instead of crashing). Records an LLM timing event when a perf logger
+    is present on state."""
+    perf = state.get("performance_logger") if isinstance(state, dict) else None
+    start = time.perf_counter()
     try:
         completion = client.chat.completions.create(model=MODEL, messages=messages)
-        return completion.choices[0].message.content
     except Exception as exc:
         log_structural(state, "WATCH", f"{what} failed: {exc}")
         return None
+    latency_ms = (time.perf_counter() - start) * 1000.0
+    content = completion.choices[0].message.content
+    if perf is not None:
+        usage = getattr(completion, "usage", None)
+        perf.record_llm(
+            "LLM Request",
+            latency_ms,
+            model=MODEL,
+            prompt_tokens=getattr(usage, "prompt_tokens", None),
+            completion_tokens=getattr(usage, "completion_tokens", None),
+            total_tokens=getattr(usage, "total_tokens", None),
+            prompt_chars=sum(len(m.get("content", "")) for m in messages),
+            completion_chars=len(content or ""),
+        )
+    return content
 
 
 def format_phase_label(state: dict) -> str:
@@ -463,6 +496,7 @@ def _signal_turn(history, state, session, injection, user_message):
     """Run a single injected LLM turn for a conclude signal (button or lexical).
     Mirrors respond()'s message assembly but with a fixed Layer 2 injection."""
     history = history or []
+    get_perf(state)  # ensure the performance logger exists for the LLM call below
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if LEARNER_PROFILE:
@@ -541,42 +575,53 @@ def _create_session(message, history, state):
     through to the normal respond() LLM call — either because the session was created
     successfully (state['inquiry_session'] is now set) or because decomposition failed
     and Layer 1 should handle the turn (session stays None)."""
-    qa = analyse_origin_question(
-        message,
-        incomplete_prompted_already=state.get("incomplete_prompted_already", False),
-    ).analysis
+    perf = get_perf(state)
+    with perf.measure("Session Creation Total", {"umbrella": True}):
+        ar = analyse_origin_question(
+            message,
+            incomplete_prompted_already=state.get("incomplete_prompted_already", False),
+        )
+        qa = ar.analysis
+        perf.record_llm("Origin Question Analysis", ar.latency_ms, model=MODEL,
+                        total_tokens=ar.tokens_used, completion_chars=len(ar.raw_response or ""))
 
-    if not qa.valid:
-        if qa.gate_failed == GateFailure.INCOMPLETE:
-            state["incomplete_prompted_already"] = True
-        redirect = qa.redirect_response or "Could you rephrase that as a physical-geography question?"
-        new_history = history + [
-            {"role": "user", "content": message},
-            {"role": "assistant", "content": redirect},
-        ]
-        return new_history, state, format_phase_label(state), "", ""
+        if not qa.valid:
+            if qa.gate_failed == GateFailure.INCOMPLETE:
+                state["incomplete_prompted_already"] = True
+            redirect = qa.redirect_response or "Could you rephrase that as a physical-geography question?"
+            new_history = history + [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": redirect},
+            ]
+            return new_history, state, format_phase_label(state), "", ""
 
-    # Valid — decompose synchronously (one or two API calls, < ~1s total).
-    try:
-        result = run_decomposition(message, qa)
-    except Exception as exc:  # degrade to Layer 1, never raise
-        log_structural(state, "WATCH", f"Layer 2 decomposition failed: {exc}")
-        return None
+        # Valid — decompose synchronously (one or two API calls, < ~1s total).
+        try:
+            result = run_decomposition(message, qa)
+        except Exception as exc:  # degrade to Layer 1, never raise
+            log_structural(state, "WATCH", f"Layer 2 decomposition failed: {exc}")
+            return None
 
-    session = InquirySession(
-        topic_anchor=message,
-        question_analysis=qa,
-        target_conclusion=result.target_conclusion,
-        required_components=result.required_components,
-    )
-    session.derive_complexity()
-    state["inquiry_session"] = session
+        conclusion, decomposition = result.conclusion, result.decomposition
+        perf.record_llm("Conclusion Generation", conclusion.latency_ms, model=MODEL,
+                        total_tokens=conclusion.tokens_used, completion_chars=len(conclusion.raw_response or ""))
+        perf.record_llm("Conclusion Decomposition", decomposition.latency_ms, model=MODEL,
+                        total_tokens=decomposition.tokens_used, completion_chars=len(decomposition.raw_response or ""))
 
-    log_structural(state, "L2-INIT", (
-        f"Session created | complexity={session.complexity.value} | "
-        f"components={[c.concept for c in session.required_components]} | "
-        f"target={result.target_conclusion[:120]}..."
-    ))
+        session = InquirySession(
+            topic_anchor=message,
+            question_analysis=qa,
+            target_conclusion=result.target_conclusion,
+            required_components=result.required_components,
+        )
+        session.derive_complexity()
+        state["inquiry_session"] = session
+
+        log_structural(state, "L2-INIT", (
+            f"Session created | complexity={session.complexity.value} | "
+            f"components={[c.concept for c in session.required_components]} | "
+            f"target={result.target_conclusion[:120]}..."
+        ))
 
     # Session is set in state — fall through so respond() continues to the LLM call
     # and generates the tutor's first question in response to the learner's question.
@@ -643,10 +688,13 @@ def respond(message, history, state):
         "structural_events": [],
         "inquiry_session": None,              # InquirySession | None
         "incomplete_prompted_already": False, # True after first incomplete prompt
+        "performance_logger": None,           # PerformanceLogger | None
     }
     prev_resolved = bool(state.get("resolved", False))
     prev_phase = state.get("phase", "ask")
     prev_unresolved_streak = state.get("conclude_unresolved_streak", 0)
+
+    perf = get_perf(state)  # persistent per-session performance logger
 
     # Optional Layer 2 session (created lazily on the first valid origin question).
     session = state.get("inquiry_session") if isinstance(state, dict) else None
@@ -716,7 +764,8 @@ def respond(message, history, state):
     # (computed from session state entering this turn). Otherwise fall back to the
     # Layer 1 fallback ladder (state-dict driven).
     if session is not None:
-        decision = decide(session)
+        with perf.measure("Decision Policy"):
+            decision = decide(session)
         log_structural(state, "DECISION", str(decision))
         cc = session.current_component
         if cc is not None:
@@ -728,7 +777,9 @@ def respond(message, history, state):
         else:
             log_structural(state, "L2-DP", f"component={session.current_component_index} (none — all covered)")
         state["last_action"] = decision.action
-        messages.append({"role": "system", "content": build_injection(decision, session)})
+        with perf.measure("Action Injection"):
+            action_injection = build_injection(decision, session)
+        messages.append({"role": "system", "content": action_injection})
     elif override_to_conclude:
         messages.append({"role": "system", "content": OVERRIDE_TO_CONCLUDE_MSG})
     elif fallback_rung > 0 and prev_phase == "investigate":
@@ -751,7 +802,8 @@ def respond(message, history, state):
         ]
         return history, state, format_phase_label(state), "", ""
 
-    visible_reply, state_tag, component_tag = parse_state(raw_reply)
+    with perf.measure("STATE/COMPONENT Parsing"):
+        visible_reply, state_tag, component_tag = parse_state(raw_reply)
     parsed = _state_tag_to_dict(state_tag)
 
     # Guard: if the model returned only a STATE tag with no body, retry once.
@@ -798,7 +850,8 @@ def respond(message, history, state):
     # returned bool, not by comparing indices).
     component_advanced = False
     if component_tag is not None and session is not None:
-        component_advanced = apply_component_update(session, component_tag, partial(log_structural, state))
+        with perf.measure("Component Update"):
+            component_advanced = apply_component_update(session, component_tag, partial(log_structural, state))
     if session is not None and session.current_component is not None and not component_advanced:
         session.current_component.attempts += 1
 
@@ -821,7 +874,8 @@ def respond(message, history, state):
     # session.hypothesis_status was just updated by apply_component_update; pair it
     # with the learner's own words to build a chronological hypothesis_history.
     if session is not None and state.get("hypothesis_recorded"):
-        _maybe_record_hypothesis(session, message, history, state)
+        with perf.measure("Hypothesis Recording"):
+            _maybe_record_hypothesis(session, message, history, state)
 
     # --- attempts_this_phase counter ------------------------------------------
     new_phase = state["phase"]
@@ -884,7 +938,8 @@ def respond(message, history, state):
     auto_status = ""
     if state["resolved"] and not prev_resolved:
         try:
-            path = export_markdown(history, state)
+            with perf.measure("Markdown Export"):
+                path = export_markdown(history, state)
         except Exception as exc:  # auto-export must never crash the chat turn
             log_structural(state, "WATCH", f"auto-export failed: {exc}")
             path = None
@@ -913,7 +968,9 @@ def export_session(history, state):
     }
     try:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(record, f, indent=2, ensure_ascii=False)
+            # default=str so non-serialisable runtime objects in state
+            # (InquirySession, PerformanceLogger) degrade to a repr instead of raising.
+            json.dump(record, f, indent=2, ensure_ascii=False, default=str)
     except OSError as exc:
         print(f"[WARN] could not write session export: {exc}")
         return f"⚠️ Could not save session: {exc}"
@@ -1101,6 +1158,12 @@ def export_markdown(history, state):
     if layer2_session is not None:
         layer2_block = f"{_format_layer2_section(layer2_session)}\n---\n\n"
 
+    # Runtime performance block — only when timing data exists.
+    perf = state.get("performance_logger") if isinstance(state, dict) else None
+    perf_block = ""
+    if perf is not None and perf.events:
+        perf_block = f"## Runtime Performance\n\n```\n{perf.format_report()}\n```\n\n---\n\n"
+
     document = (
         f"# Session Log\n\n"
         f"**Origin Question:** {origin}\n"
@@ -1114,6 +1177,7 @@ def export_markdown(history, state):
         f"{structural_section}\n\n"
         f"---\n\n"
         f"{layer2_block}"
+        f"{perf_block}"
         f"## Evaluation\n\n"
         f"{evaluation}\n"
     )
@@ -1244,6 +1308,7 @@ def reset_for_new_query(history, state):
         "structural_events": [],
         "inquiry_session": None,
         "incomplete_prompted_already": False,
+        "performance_logger": None,
     }
     return [GREETING_MSG], fresh_state, format_phase_label(fresh_state), "", ""
 
@@ -1288,6 +1353,7 @@ with gr.Blocks(title="Polaris Tutor") as demo:
         "structural_events": [],
         "inquiry_session": None,
         "incomplete_prompted_already": False,
+        "performance_logger": None,
     })
 
     msg.submit(respond, [msg, chatbot, state], [chatbot, state, phase_display, msg, export_status])
