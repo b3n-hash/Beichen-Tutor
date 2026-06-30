@@ -13,6 +13,7 @@ from openai import OpenAI
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, MODEL
 from layer2.action_prompts import build_injection
 from layer2.decision_policy import decide
+from layer2.fallback_prompts import FALLBACK_INJECTIONS
 from layer2.models import Component, HypothesisStatus, InquirySession
 
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
@@ -55,33 +56,8 @@ SURRENDER_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Rung-specific instructions injected as a system message before the user's turn.
-# Keyed by fallback_rung (0 injects nothing). {n} = attempts_this_phase.
-FALLBACK_INJECTIONS = {
-    1: (
-        "[EXHAUSTION FALLBACK — RUNG A ACTIVE] The Learner has not progressed after {n} attempts in the "
-        "INVESTIGATE phase. Apply Rung A: reframe or narrow the inquiry — abandon the current angle and try a "
-        "completely different approach or a simpler sub-question. Do NOT repeat the investigative question that "
-        "has already stalled."
-    ),
-    2: (
-        "[EXHAUSTION FALLBACK — RUNG B ACTIVE] The Learner has not progressed after {n} attempts in the "
-        "INVESTIGATE phase. Apply Rung B: give a small, concrete hint — one piece of information or an analogy — "
-        "then invite the Learner to reattempt. Do NOT ask the same investigative question again."
-    ),
-    3: (
-        "[EXHAUSTION FALLBACK — RUNG C ACTIVE] The Learner has not progressed after {n} attempts in the "
-        "INVESTIGATE phase. Apply Rung C: partially scaffold — supply a worked partial answer that lays out part "
-        "of the mechanism, then ask the Learner to complete the remaining step themselves."
-    ),
-    4: (
-        "[EXHAUSTION FALLBACK — RUNG D ACTIVE] The Learner has not progressed after {n} attempts in the "
-        "INVESTIGATE phase, and Rungs A–C are exhausted. Apply Rung D: you are now permitted to state the "
-        "mechanism or near-answer explicitly. Under Rule 1 this is the legitimate closure case, NOT a violation "
-        "— providing it here is what makes the Learner's eventual restatement valid. Deliver it clearly, then "
-        "invite the Learner to restate the conclusion in their own words."
-    ),
-}
+# Rung-specific injections live in layer2 so app.py and layer2.action_prompts can
+# both import them without a circular dependency (app → layer2, never the reverse).
 
 # Used when the Learner surrenders again after already receiving Rung D.
 OVERRIDE_TO_CONCLUDE_MSG = (

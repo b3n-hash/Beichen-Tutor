@@ -34,6 +34,10 @@ class PolicyDecision:
     context: dict[str, Any] = field(default_factory=dict)
     confidence: float = 1.0              # policy's confidence in this decision (not LLM confidence)
 
+    def __str__(self) -> str:
+        rung = f" rung={self.rung}" if self.action == ACTION_FALLBACK else ""
+        return f"PolicyDecision({self.action}{rung}, confidence={self.confidence:.2f}, reason={self.reason!r})"
+
 
 def decide(session: InquirySession) -> PolicyDecision:
     """Read session state and return the next tutoring action.
@@ -81,8 +85,17 @@ def decide(session: InquirySession) -> PolicyDecision:
             confidence=0.95,
         )
 
-    # --- Step 4: mastery/groundedness matrix ---------------------------------
+    # --- Step 4: mastery/groundedness matrix (6 cells, every combination) -----
+    # Bridge = connect what they already have; Evidence = supply missing
+    # justification; Inquiry = still exploring; Advance = endpoint.
     m, g = component.mastery, component.groundedness
+
+    def evidence_decision(reason: str) -> PolicyDecision:
+        return PolicyDecision(
+            action=ACTION_EVIDENCE,
+            reason=reason,
+            context={"preferred_type": _preferred_evidence_type(session)},
+        )
 
     if m >= 0.7 and g >= 0.6:
         component.mark_covered()  # the only permitted session mutation
@@ -93,20 +106,16 @@ def decide(session: InquirySession) -> PolicyDecision:
             reason="mastery and groundedness thresholds met",
             context={"next_component": nxt},
         )
+    if m >= 0.7:  # g < 0.6
+        return evidence_decision("mastery high but groundedness short of threshold — introduce evidence")
     if m < 0.4 and g < 0.4:
         return PolicyDecision(action=ACTION_INQUIRY, reason="low mastery and groundedness — open inquiry")
-    if m < 0.4 and g >= 0.4:
+    if m < 0.4:  # g >= 0.4
         return PolicyDecision(action=ACTION_BRIDGE, reason="grounded reasoning but low comprehension — bridge")
-    if m >= 0.4 and g < 0.4:
-        return PolicyDecision(
-            action=ACTION_EVIDENCE,
-            reason="comprehension present but ungrounded — introduce evidence",
-            context={"preferred_type": _preferred_evidence_type(session)},
-        )
-
-    # Matrix gap: partial mastery (0.4–0.7) with some groundedness, not yet at the
-    # advance threshold — keep working the component via inquiry.
-    return PolicyDecision(action=ACTION_INQUIRY, reason="partial mastery — continue inquiry")
+    # 0.4 <= m < 0.7
+    if g < 0.4:
+        return evidence_decision("comprehension present but ungrounded — introduce evidence")
+    return PolicyDecision(action=ACTION_BRIDGE, reason="partial mastery with some grounding — bridge")
 
 
 def _preferred_evidence_type(session: InquirySession) -> str:

@@ -15,6 +15,7 @@ from layer2.decision_policy import (
     ACTION_INQUIRY,
     PolicyDecision,
 )
+from layer2.fallback_prompts import FALLBACK_INJECTIONS
 from layer2.models import InquirySession
 
 
@@ -65,9 +66,7 @@ def build_injection(decision: PolicyDecision, session: InquirySession) -> str:
         )
 
     if decision.action == ACTION_FALLBACK:
-        # Delegate to the canonical rung wording defined in app.py — do not duplicate.
-        from app import FALLBACK_INJECTIONS  # lazy import avoids a circular dependency
-
+        # Canonical rung wording lives in layer2.fallback_prompts (imported above).
         rung = decision.rung or decision.context.get("rung", 0)
         attempts = cc.attempts if cc is not None else 0
         template = FALLBACK_INJECTIONS.get(rung)
