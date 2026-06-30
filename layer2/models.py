@@ -99,6 +99,7 @@ class QuestionAnalysis:
     grammar_keywords: Optional[GrammarKeywords] = None
     prior_knowledge_level: PriorKnowledge = PriorKnowledge.NOVICE
     assumed_known_concepts: list[str] = field(default_factory=list)
+    confidence: float = 0.0             # classifier's confidence in its classification (0–1)
 
 
 # --- Evidence -----------------------------------------------------------------
@@ -155,6 +156,8 @@ class InquirySession:
     evidence_repository: list[Evidence] = field(default_factory=list)
     sub_inquiries: list[str] = field(default_factory=list)
     complexity: Optional[Complexity] = None
+    premise_under_investigation: bool = False   # True when question_class="false_premise";
+    # tutor addresses the premise before the main inquiry
 
     @property
     def current_component(self) -> Optional[Component]:
