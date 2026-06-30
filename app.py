@@ -204,8 +204,10 @@ Only omit the COMPONENT tag when phase is not INVESTIGATE or no specific compone
 
 
 def log_structural(state: dict, tag: str, message: str) -> None:
-    """Append a tagged structural event to state['structural_events'] and echo to stdout."""
-    entry = f"[{tag}] {message}"
+    """Append a tagged, timestamped structural event to state['structural_events']
+    and echo to stdout."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    entry = f"[{timestamp}] [{tag}] {message}"
     state.setdefault("structural_events", []).append(entry)
     print(entry)
 
@@ -511,6 +513,12 @@ def _create_session(message, history, state):
     session.derive_complexity()
     state["inquiry_session"] = session
 
+    log_structural(state, "L2-INIT", (
+        f"Session created | complexity={session.complexity.value} | "
+        f"components={[c.concept for c in session.required_components]} | "
+        f"target={result.target_conclusion[:120]}..."
+    ))
+
     # Session is set in state — fall through so respond() continues to the LLM call
     # and generates the tutor's first question in response to the learner's question.
     return None
@@ -577,10 +585,11 @@ def respond(message, history, state):
     session = state.get("inquiry_session") if isinstance(state, dict) else None
 
     # --- Layer 2 session creation (first message only, synchronous) ------------
-    # Detect the first real message: no session yet and no prior learner turns.
-    # (history is not empty on the first turn because it carries the UI greeting.)
-    first_message = session is None and not any(t.get("role") == "user" for t in history)
-    if first_message and isinstance(state, dict):
+    # Try to create a session on every message until one exists — earlier turns may
+    # have been redirected (e.g. an out-of-scope question), so the first *valid*
+    # origin question can arrive well after the literal first message.
+    should_try_create = session is None and isinstance(state, dict)
+    if should_try_create:
         created = _create_session(message, history, state)
         if created is not None:
             return created  # redirect only (invalid question)
@@ -737,7 +746,7 @@ def respond(message, history, state):
     else:
         state["attempts_this_phase"] = 1  # reset on phase transition
 
-    if new_phase == "investigate" and state["attempts_this_phase"] > FALLBACK_THRESHOLD:
+    if new_phase == "investigate" and state["attempts_this_phase"] == FALLBACK_THRESHOLD + 1:
         log_structural(
             state, "FALLBACK",
             f"Learner on attempt {state['attempts_this_phase']} in phase={new_phase}; "
@@ -980,7 +989,12 @@ def export_markdown(history, state):
         n += 1
 
     transcript = build_transcript(history) if history else "_(no turns recorded)_"
-    origin = next((t["content"] for t in history if t["role"] == "user"), "(none)")
+    # Prefer the session's topic_anchor (the real origin question) over the first
+    # user turn, which may be a redirected out-of-scope message.
+    layer2_session = state.get("inquiry_session") if isinstance(state, dict) else None
+    origin = layer2_session.topic_anchor if layer2_session else next(
+        (t["content"] for t in history if t["role"] == "user"), "(none)"
+    )
 
     trajectory, evaluation = "", "_(no transcript to evaluate)_"
     if history:
@@ -998,8 +1012,7 @@ def export_markdown(history, state):
         else "_(none detected)_"
     )
 
-    # Layer 2 session block — only when a live session exists.
-    layer2_session = state.get("inquiry_session") if isinstance(state, dict) else None
+    # Layer 2 session block — only when a live session exists (layer2_session above).
     layer2_block = ""
     if layer2_session is not None:
         layer2_block = f"{_format_layer2_section(layer2_session)}\n---\n\n"
@@ -1145,6 +1158,8 @@ def reset_for_new_query(history, state):
         "attempts_this_phase": 0,
         "fallback_rung": 0,
         "structural_events": [],
+        "inquiry_session": None,
+        "incomplete_prompted_already": False,
     }
     return [GREETING_MSG], fresh_state, format_phase_label(fresh_state), "", ""
 
