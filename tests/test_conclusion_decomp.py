@@ -1,11 +1,12 @@
 """Tests for layer2/conclusion_decomp.py
 
-Three cases:
-  1. "Why do rivers meander?"           — novice, known_phenomenon
+Four cases:
+  1. "Why do rivers meander?"           — novice, known_phenomenon (discoverability ordering)
   2. "Why does adiabatic cooling cause orographic precipitation?"
                                          — advanced, mastery preseeding
   3. "Why is the sky blue because of the ocean?"
                                          — misconception, ensure pipeline succeeds
+  4. "Why is the sky blue?"             — novice, known_phenomenon (discoverability ordering)
 
 Hard assertions: component count bounds, non-empty fields, no duplicates,
                  mastery preseeding correctness.
@@ -106,6 +107,23 @@ def _print_components(components, prefix=""):
         print()
 
 
+def _warn_if_premature_jargon(components, assumed_known_concepts, jargon_terms, label) -> list[str]:
+    """Heuristic only, never a hard fail: Component 0 should not be built around jargon the
+    learner hasn't already demonstrated (per assumed_known_concepts)."""
+    if not components:
+        return []
+    known_lower = {k.lower() for k in assumed_known_concepts}
+    first_text = f"{components[0].concept} {components[0].statement}".lower()
+    warns = []
+    for term in jargon_terms:
+        if term in first_text and not any(term in k or k in term for k in known_lower):
+            warns.append(
+                f"Heuristic [{label}]: Component 0 leads with specialist term '{term}' "
+                f"('{components[0].concept}') with no prior exposure in assumed_known_concepts"
+            )
+    return warns
+
+
 # ---------------------------------------------------------------------------
 # Case 1: "Why do rivers meander?" — novice, known_phenomenon
 # ---------------------------------------------------------------------------
@@ -133,6 +151,11 @@ def case_1() -> tuple[int, int, list[str]]:
     _print_components(result.required_components)
 
     warns, hp, ht = _assert_components_valid(result.required_components, "Case 1")
+    warns += _warn_if_premature_jargon(
+        result.required_components, [],
+        ["helicoidal flow", "helicoidal", "secondary circulation", "differential erosion"],
+        "Case 1",
+    )
     return hp, ht, warns
 
 
@@ -185,6 +208,11 @@ def case_2() -> tuple[int, int, list[str]]:
             )
             hp += 1
 
+    warns += _warn_if_premature_jargon(
+        result.required_components, assumed_known,
+        ["adiabatic cooling", "orographic precipitation", "adiabatic lapse rate"],
+        "Case 2",
+    )
     return hp, ht, warns
 
 
@@ -236,6 +264,41 @@ def case_3() -> tuple[int, int, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Case 4: "Why is the sky blue?" — novice, discoverability ordering
+# ---------------------------------------------------------------------------
+
+def case_4() -> tuple[int, int, list[str]]:
+    question = "Why is the sky blue?"
+    analysis = _make_analysis(
+        question_type=QuestionType.WHY,
+        question_class=QuestionClass.KNOWN_PHENOMENON,
+        operative="Why is",
+        prior_knowledge=PriorKnowledge.NOVICE,
+    )
+
+    result = run_decomposition(question, analysis)
+
+    print("=" * 60)
+    print("CASE 4 — Why is the sky blue?")
+    print("=" * 60)
+    print(f"\nTarget conclusion:\n  {result.target_conclusion}\n")
+    print(f"  Conclusion latency : {result.conclusion.latency_ms:.0f} ms")
+    print(f"  Conclusion tokens  : {result.conclusion.tokens_used}")
+    print(f"  Decomp latency     : {result.decomposition.latency_ms:.0f} ms")
+    print(f"  Decomp tokens      : {result.decomposition.tokens_used}")
+    print(f"\nComponents ({len(result.required_components)}):")
+    _print_components(result.required_components)
+
+    warns, hp, ht = _assert_components_valid(result.required_components, "Case 4")
+    warns += _warn_if_premature_jargon(
+        result.required_components, [],
+        ["rayleigh scattering", "rayleigh", "electric dipole", "dipole oscillation"],
+        "Case 4",
+    )
+    return hp, ht, warns
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -244,7 +307,7 @@ def main():
     all_hard_total = 0
     all_warns: list[str] = []
 
-    for case_fn in (case_1, case_2, case_3):
+    for case_fn in (case_1, case_2, case_3, case_4):
         hp, ht, warns = case_fn()
         all_hard_pass += hp
         all_hard_total += ht

@@ -126,9 +126,15 @@ def _build_components(
 def _generate_target(question: str, question_analysis: QuestionAnalysis) -> ConclusionResult:
     """Single LLM call. Returns ConclusionResult."""
     system = (
-        f"You are an expert in {DOMAIN} producing an internal answer for a tutoring system.\n"
-        "This answer will be decomposed into teaching components — it is never shown to the learner directly.\n"
-        "Be accurate and concise. Include the key mechanism(s), cause(s), and consequence(s). 2–4 sentences maximum."
+        f"You are a {DOMAIN} tutor preparing an internal answer that will later be broken into a sequence of "
+        "discoveries for a novice learner doing guided inquiry — it is never shown to the learner directly.\n"
+        "Produce the simplest scientifically sufficient explanation of the phenomenon: preserve full causal "
+        "correctness, but do not optimise for encyclopaedic completeness or expert depth.\n"
+        "Introduce technical terminology only where it is necessary to name the mechanism, or where it follows "
+        "naturally from a concept you've just explained in plain language — never as the entry point.\n"
+        "Prefer observable effects and everyday causal reasoning over abstract or derived concepts; lead with "
+        "what a careful observer would notice, not with the deepest underlying theory.\n"
+        "Be concise: 2–4 sentences maximum, including the key mechanism(s), cause(s), and consequence(s)."
     )
     user = (
         f'Question: "{question}"\n'
@@ -160,9 +166,9 @@ def _generate_target(question: str, question_analysis: QuestionAnalysis) -> Conc
 
 
 _ORDERING_TEMPLATE = """\
-- "why"  → causal chain: prerequisite → mechanism → consequence
-- "how"  → process / sequence: step 1 → step 2 → step 3
-- "when" / "where" → conditional: condition → trigger → outcome"""
+- "why"  → discovery chain: observation/pattern → mechanism → abstract principle → (terminology, if it earns its place) → broader consequence
+- "how"  → process / sequence a learner could trace step by step: step 1 → step 2 → step 3
+- "when" / "where" → conditional a learner could notice and test: condition → trigger → outcome"""
 
 _JSON_SCHEMA = """\
 [
@@ -183,21 +189,73 @@ def _decompose(
     Raises ValueError if both attempts fail validation.
     """
     system = (
-        f"You are a pedagogical analyst decomposing a {DOMAIN} explanation into teachable components.\n"
+        f"You are a pedagogical analyst sequencing a {DOMAIN} explanation into a guided-discovery inquiry for "
+        "a novice learner — not into an expert's logical dependency graph.\n"
+        "Optimise for discoverability, inferability, and cognitive continuity: the sequence a good human tutor "
+        "would lead a curious learner through, not the deepest or most theoretically complete ordering.\n"
         "Respond only with a valid JSON array. No explanation, no preamble, no markdown fences."
     )
+    known_str = ", ".join(assumed_known_concepts) if assumed_known_concepts else "none"
     user = (
-        "Decompose this conclusion into the minimal ordered set of conceptual premises "
-        "a learner must understand.\n\n"
+        "Sequence this conclusion into the smallest smoothly teachable sequence of conceptual discoveries that "
+        "would let a novice learner independently reconstruct it through guided inquiry — not the minimal set "
+        "of logical premises an expert would list, and not compressed further than the inquiry can stay smooth "
+        "and natural.\n\n"
         f'Question: "{question}"\n'
         f'Question type: "{question_type}"\n'
-        f'Target conclusion: "{target_conclusion}"\n\n'
+        f'Target conclusion: "{target_conclusion}"\n'
+        f"Concepts the learner already knows (may be used freely, including early): {known_str}\n\n"
         f"Ordering template:\n{_ORDERING_TEMPLATE}\n\n"
+        "For every candidate component, ask internally:\n"
+        "- Could a curious novice plausibly infer or notice this next, given what comes before it?\n"
+        "- Is there an observable phenomenon that naturally precedes this concept?\n"
+        "- Does this concept require specialist vocabulary the learner hasn't been given yet?\n"
+        "- Would delaying this concept reduce cognitive load without breaking causal correctness?\n"
+        "- Would successfully understanding this component make the next one feel like a natural question "
+        "rather than a new topic? Prefer sequences where each answer generates the next question, over a list "
+        "of isolated facts.\n"
+        "- Could a single clear Socratic question reasonably lead the learner to discover this component? If "
+        "you cannot imagine one, the component is probably too large or too abstract and should be split.\n"
+        "- Could this be reached by extending or reusing an idea already introduced, rather than starting a "
+        "fresh concept? Prefer extending and reusing ideas already introduced over introducing entirely new "
+        "ones — a learner should feel each component is a continuation of the conversation so far, not a new "
+        "topic.\n\n"
+        "Between adjacent components, there should be no hidden inference that would reasonably require its own "
+        "tutor question. If a learner would naturally ask \"why?\" or \"how?\" between two neighbouring "
+        "components, insert another component instead of expecting the learner to bridge the gap unaided.\n\n"
+        "A typical novice should usually be able to discover one component within roughly one to three tutor "
+        "exchanges. If a component would normally require substantially longer, split it into smaller "
+        "conceptual discoveries rather than expecting the learner to make several major inferences at once.\n\n"
+        "The first one or two components should usually be concepts the learner could plausibly observe or "
+        "infer without specialist vocabulary, not the deepest scientific explanation — sometimes the first "
+        "observation is too trivial to stand alone, and the first pair forms the natural entry point. A learner "
+        "should almost never need to memorise a name before understanding the underlying phenomenon — prefer "
+        "teaching the idea first and introducing its technical name afterwards. Treat technical terminology as "
+        "labels attached to ideas the learner has already constructed, not as the ideas themselves: it should "
+        "usually appear once the learner has already built the underlying intuition, not in those opening "
+        "components — unless the term is already in the learner's known concepts above.\n\n"
+        "Example — prefer a chain where each component naturally raises the next question, e.g.:\n"
+        "  \"the outer bend moves faster\" (→ why does that matter?) → \"the outer bank erodes\" (→ what does "
+        "that cause?) → \"the bend grows\" (→ why does the flow organise itself that way?) → \"this reinforcing "
+        "pattern is called helicoidal flow\"\n"
+        "over a list of isolated facts:\n"
+        "  \"helicoidal flow\" → \"differential erosion\" → \"meander growth\"\n\n"
+        "Do not sacrifice scientific correctness for simplicity — every statement must remain fully accurate. "
+        "The optimisation target is pedagogical sequencing, not dumbing down the science. When in doubt, "
+        "optimise for the conversation the tutor will have, not the ontology of the subject. The output should "
+        "resemble the path an excellent human teacher would guide a learner through, rather than the structure "
+        "of an expert textbook or scientific paper.\n\n"
         f"Return a JSON array where each object has exactly two fields:\n{_JSON_SCHEMA}\n\n"
         "Rules:\n"
         "- Minimum 2 items, maximum 6\n"
-        "- Order by prerequisite dependency — earlier items must be understood before later ones\n"
-        "- Do not include concepts derivable from earlier items without new information\n"
+        "- Order by the sequence a tutor would naturally help a learner discover, not by theoretical "
+        "dependency depth\n"
+        "- Every component should correspond to a single discoverable idea that can naturally become the focus "
+        "of one investigative question.\n"
+        "- Do not include concepts inferable from earlier items without new information\n"
+        "- No hidden leaps: if a learner would need to ask \"why?\" or \"how?\" to get from one component to "
+        "the next, insert the missing component rather than leaving the gap\n"
+        "- Reuse and extend ideas already introduced before reaching for an entirely new one\n"
         "- Each statement must be a complete, standalone causal claim"
     )
 
