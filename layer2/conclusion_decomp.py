@@ -100,13 +100,14 @@ def _build_components(
     assumed_known_concepts: list[str],
 ) -> list[Component]:
     components: list[Component] = []
-    for item in items:
+    for index, item in enumerate(items):
         concept = item["concept"].strip()
         mastery = 0.5 if any(
             concept.lower() in known.lower() or known.lower() in concept.lower()
             for known in assumed_known_concepts
         ) else 0.0
         components.append(Component(
+            id=index,
             concept=concept,
             statement=item["statement"].strip(),
             mastery=mastery,

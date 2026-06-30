@@ -123,8 +123,9 @@ class Evidence:
 
 @dataclass
 class Component:
-    concept: str                        # node term, e.g. "mantle convection"
-    statement: str                      # causal claim
+    id: int = 0                         # stable index, assigned at construction time
+    concept: str = ""                   # node term, e.g. "mantle convection"
+    statement: str = ""                 # causal claim
     mastery: float = 0.0               # 0–1: estimated learner comprehension
     groundedness: float = 0.0          # 0–1: degree understanding is justified
     covered: bool = False              # one-way latch — never set directly; use mark_covered()

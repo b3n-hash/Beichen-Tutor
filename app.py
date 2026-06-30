@@ -1,16 +1,31 @@
+from __future__ import annotations
+
 import json
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 
 import gradio as gr
 from openai import OpenAI
 
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, MODEL
+from layer2.models import Component, HypothesisStatus, InquirySession
 
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
 STATE_TAG_RE = re.compile(r"^\s*\[STATE\s+phase=(ask|investigate|conclude)\s+hypothesis_recorded=(true|false)\s+resolved=(true|false)\]\s*\n?", re.IGNORECASE)
+
+COMPONENT_TAG_RE = re.compile(
+    r"^\[COMPONENT\s+"
+    r"id=(\d+)\s+"
+    r"mastery=([\d.]+)\s+"
+    r"groundedness=([\d.]+)"
+    r"(?:\s+hypothesis_status=(false|true_ungrounded|true_grounded))?"
+    r"\s*\]\s*\n?",
+    re.IGNORECASE,
+)
 
 # Phrases that signal the tutor is confirming a learner answer — only flagged
 # when uttered during ASK or INVESTIGATE (premature confirmation).
@@ -163,6 +178,16 @@ investigates it, and then states their own conclusion to that new question. Ackn
 small talk that pose no new question (e.g. "thanks", "that was helpful", "cool") are NOT a new inquiry: on
 those turns keep phase=ask, hypothesis_recorded=false, and resolved=false. Never set hypothesis_recorded=true
 or phase=conclude unless a real, open Hypothesis for a question currently under investigation actually exists.
+
+Component tracking requirement: when phase=INVESTIGATE and a component is being
+actively worked on, emit a second tag on the line immediately after the STATE line:
+[COMPONENT id=<integer> mastery=<0.0–1.0> groundedness=<0.0–1.0> hypothesis_status=<false|true_ungrounded|true_grounded>]
+id: the integer index of the component currently being taught (provided in [CURRENT COMPONENT] below).
+mastery: your best estimate of how well the Learner understands this concept (0=no understanding, 1=clear mastery).
+groundedness: your best estimate of how well the Learner has justified their understanding through reasoning or evidence (0=no justification, 1=fully grounded).
+hypothesis_status: your current classification of the Learner's hypothesis relative to this component.
+These tags are stripped before the Learner sees them. Emit your best estimate — they drive the Decision Policy.
+Only omit the COMPONENT tag when phase is not INVESTIGATE or no specific component is being worked on.
 """
 
 
@@ -195,15 +220,124 @@ def format_phase_label(state: dict) -> str:
     )
 
 
-def parse_state(reply: str):
-    match = STATE_TAG_RE.match(reply)
-    if not match:
-        return reply.strip(), None
-    phase = match.group(1).lower()
-    recorded = match.group(2).lower() == "true"
-    resolved = match.group(3).lower() == "true"
-    visible = reply[match.end():].strip()
-    return visible, {"phase": phase, "hypothesis_recorded": recorded, "resolved": resolved}
+@dataclass
+class ParsedStateTag:
+    phase: str
+    hypothesis_recorded: bool
+    resolved: bool
+
+
+@dataclass
+class ParsedComponentTag:
+    component_id: int
+    mastery: float
+    groundedness: float
+    hypothesis_status: str | None
+
+
+def parse_state(reply: str) -> tuple[str, ParsedStateTag | None, ParsedComponentTag | None]:
+    """Returns (visible_reply, state_tag, component_tag).
+    component_tag is None if no COMPONENT tag was present."""
+    state_tag = None
+    component_tag = None
+    rest = reply
+
+    state_match = STATE_TAG_RE.match(rest)
+    if state_match:
+        state_tag = ParsedStateTag(
+            phase=state_match.group(1).lower(),
+            hypothesis_recorded=state_match.group(2).lower() == "true",
+            resolved=state_match.group(3).lower() == "true",
+        )
+        rest = rest[state_match.end():]
+
+    # COMPONENT tag, if present, sits on the line immediately after STATE.
+    component_source = rest.lstrip()
+    component_match = COMPONENT_TAG_RE.match(component_source)
+    if component_match:
+        try:
+            component_tag = ParsedComponentTag(
+                component_id=int(component_match.group(1)),
+                mastery=float(component_match.group(2)),
+                groundedness=float(component_match.group(3)),
+                hypothesis_status=(component_match.group(4).lower() if component_match.group(4) else None),
+            )
+        except (ValueError, AttributeError):
+            component_tag = None
+        rest = component_source[component_match.end():]
+
+    return rest.strip(), state_tag, component_tag
+
+
+def _state_tag_to_dict(state_tag: ParsedStateTag | None) -> dict | None:
+    """Adapter: the downstream logic in respond() still operates on the legacy
+    dict shape, so convert the typed tag back into it."""
+    if state_tag is None:
+        return None
+    return {
+        "phase": state_tag.phase,
+        "hypothesis_recorded": state_tag.hypothesis_recorded,
+        "resolved": state_tag.resolved,
+    }
+
+
+def apply_component_update(session: InquirySession, tag: ParsedComponentTag, log_fn) -> None:
+    """Apply a parsed COMPONENT tag to the live Component in the session.
+    Validation failures emit a [WATCH] via log_fn and abort the update (no clamping)."""
+    # 1. Range validation — never clamp; an out-of-range value signals a prompt bug.
+    if not (0.0 <= tag.mastery <= 1.0 and 0.0 <= tag.groundedness <= 1.0):
+        log_fn("WATCH", f"COMPONENT tag out of range (mastery={tag.mastery}, "
+                        f"groundedness={tag.groundedness}) — ignoring update")
+        return
+
+    # 2. Bounds check on the component id.
+    if not (0 <= tag.component_id < len(session.required_components)):
+        log_fn("WATCH", f"COMPONENT tag id={tag.component_id} out of range "
+                        f"(have {len(session.required_components)} components) — ignoring")
+        return
+
+    # 3. Must match the component currently being taught.
+    if tag.component_id != session.current_component_index:
+        log_fn("WATCH", f"COMPONENT tag id={tag.component_id} does not match current "
+                        f"component {session.current_component_index} — ignoring")
+        return
+
+    component = session.required_components[tag.component_id]
+
+    # 4. Update scores.
+    component.mastery = tag.mastery
+    component.groundedness = tag.groundedness
+
+    # 5. Update hypothesis status if supplied (coerced to the enum for consistency
+    # with record_hypothesis; the regex already restricts it to valid values).
+    if tag.hypothesis_status is not None:
+        session.hypothesis_status = HypothesisStatus(tag.hypothesis_status)
+
+    # 6. One-way latch; log the transition.
+    if component.mark_covered():
+        log_fn("INFO", f"component '{component.concept}' marked covered "
+                       f"(mastery={component.mastery:.2f}, groundedness={component.groundedness:.2f})")
+
+    # 7. Advance off a covered current component.
+    if component.covered and session.current_component is component:
+        session.advance_component()
+
+
+def _format_current_component(component: Component) -> str:
+    """Render the [CURRENT COMPONENT] context block injected before the LLM call."""
+    lines = [
+        "[CURRENT COMPONENT]",
+        f"id: {component.id}",
+        f"concept: {component.concept}",
+        f"statement: {component.statement}",
+        f"current mastery estimate: {component.mastery:.2f}",
+        f"current groundedness estimate: {component.groundedness:.2f}",
+        f"covered: {component.covered}",
+        f"attempts on this component: {component.attempts}",
+    ]
+    if component.confidence is not None:
+        lines.append(f"confidence: {component.confidence:.2f}")
+    return "\n".join(lines)
 
 
 def enforce_consistency(parsed: dict) -> dict:
@@ -242,6 +376,9 @@ def respond(message, history, state):
     prev_phase = state.get("phase", "ask")
     prev_unresolved_streak = state.get("conclude_unresolved_streak", 0)
 
+    # Optional Layer 2 session (absent until the inquiry pipeline is wired in).
+    session = state.get("inquiry_session") if isinstance(state, dict) else None
+
     # --- Surrender detection (accelerates the Fallback ladder) ----------------
     # Working rung carried in from prior turns; surrender can bump it this turn.
     fallback_rung = state.get("fallback_rung", 0)
@@ -264,6 +401,11 @@ def respond(message, history, state):
                 "session suggests the learner's behaviour differs."
             ),
         })
+
+    # --- Inject the component currently being taught (Layer 2) -----------------
+    if session is not None and session.current_component is not None:
+        messages.append({"role": "system", "content": _format_current_component(session.current_component)})
+
     for turn in history:
         if turn["content"] == GREETING_MSG["content"]:
             continue  # UI-only greeting; never expose it to the LLM
@@ -292,7 +434,8 @@ def respond(message, history, state):
         ]
         return history, state, format_phase_label(state), "", ""
 
-    visible_reply, parsed = parse_state(raw_reply)
+    visible_reply, state_tag, component_tag = parse_state(raw_reply)
+    parsed = _state_tag_to_dict(state_tag)
 
     # Guard: if the model returned only a STATE tag with no body, retry once.
     if not visible_reply:
@@ -301,7 +444,8 @@ def respond(message, history, state):
         retry_raw = call_model(messages, state, "empty-reply retry")
         if retry_raw is not None:
             raw_reply = retry_raw
-            visible_reply, parsed = parse_state(raw_reply)
+            visible_reply, state_tag, component_tag = parse_state(raw_reply)
+            parsed = _state_tag_to_dict(state_tag)
         if not visible_reply:
             log_structural(state, "WATCH", "empty visible reply on retry — returning placeholder")
             visible_reply = "(The model returned no response. Please try again.)"
@@ -316,9 +460,13 @@ def respond(message, history, state):
             {"role": "system", "content": STATE_REPAIR_MSG},
         ]
         repaired_raw = call_model(repair_messages, state, "STATE-repair retry")
-        repaired_visible, repaired_parsed = parse_state(repaired_raw) if repaired_raw is not None else ("", None)
+        if repaired_raw is not None:
+            repaired_visible, repaired_state, repaired_component = parse_state(repaired_raw)
+        else:
+            repaired_visible, repaired_state, repaired_component = "", None, None
+        repaired_parsed = _state_tag_to_dict(repaired_state)
         if repaired_parsed and repaired_visible:
-            visible_reply, parsed = repaired_visible, repaired_parsed
+            visible_reply, parsed, component_tag = repaired_visible, repaired_parsed, repaired_component
         else:
             log_structural(state, "WATCH", "STATE line still missing after repair — carrying prior state")
 
@@ -326,6 +474,11 @@ def respond(message, history, state):
     if LEAKED_FALLBACK_RE.search(visible_reply):
         log_structural(state, "WATCH", "stripped leaked [EXHAUSTION FALLBACK ...] marker from visible reply")
         visible_reply = LEAKED_FALLBACK_RE.sub("", visible_reply).strip()
+
+    # Apply the COMPONENT score update (Layer 2). respond() holds no update logic
+    # itself — it delegates to apply_component_update.
+    if component_tag is not None and session is not None:
+        apply_component_update(session, component_tag, partial(log_structural, state))
 
     if parsed:
         # Carry forward accumulated events and counters before state is replaced.
