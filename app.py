@@ -61,6 +61,7 @@ PERSISTENT_STATE_KEYS = {
     "incomplete_prompted_already",
     "last_action",
     "performance_logger",
+    "pending_auto_export",
 }
 
 # Hard guard: strip any fallback marker the model leaks into its visible reply.
@@ -951,19 +952,15 @@ def respond(message, history, state):
         {"role": "assistant", "content": visible_reply},
     ]
 
-    # Edge-triggered auto-export: fire once on the false -> true transition only.
-    auto_status = ""
-    if state["resolved"] and not prev_resolved:
-        try:
-            with perf.measure("Markdown Export"):
-                path = export_markdown(history, state)
-        except Exception as exc:  # auto-export must never crash the chat turn
-            log_structural(state, "WATCH", f"auto-export failed: {exc}")
-            path = None
-        if path:
-            auto_status = f"📝 Session resolved — auto-exported evaluation log to `{path}`"
+    # Auto-export no longer runs inline here — export_markdown() makes its own LLM
+    # call (evaluate_session) and was blocking this turn's reply from ever reaching
+    # the screen. Flag the false -> true transition only; the chained
+    # auto_export_if_resolved event (bound via .then() in the Blocks definition
+    # below) performs the export only after the chat turn has already been
+    # rendered to the learner.
+    state["pending_auto_export"] = bool(state["resolved"] and not prev_resolved)
 
-    return history, state, phase_label, "", auto_status
+    return history, state, phase_label, "", ""
 
 
 def export_session(history, state):
@@ -1208,6 +1205,32 @@ def export_markdown(history, state):
     return path
 
 
+def auto_export_if_resolved(history, state):
+    """Chained after respond() via .then() so the slow auto-export (it makes its own
+    LLM call inside export_markdown -> evaluate_session) never blocks the chat turn
+    that triggered it. Reads the pending_auto_export flag respond() set on the
+    false -> true transition; no-ops on every other turn. Edge-triggered only —
+    clears the flag before doing any work, so a re-render or a later turn never
+    re-fires the export. Returns only the export_status text — chatbot/state/
+    phase_display/msg are untouched by this event."""
+    state = state or {}
+    if not state.get("pending_auto_export"):
+        return ""
+    state["pending_auto_export"] = False
+
+    perf = get_perf(state)
+    try:
+        with perf.measure("Markdown Export"):
+            path = export_markdown(history, state)
+    except Exception as exc:  # auto-export must never crash the UI
+        log_structural(state, "WATCH", f"auto-export failed: {exc}")
+        path = None
+
+    if path:
+        return f"📝 Session resolved — auto-exported evaluation log to `{path}`"
+    return ""
+
+
 # --- Persistent Learner Profile -----------------------------------------------
 
 # Accumulating behavioural profile, written at repo root under user/.
@@ -1373,7 +1396,8 @@ with gr.Blocks(title="Polaris Tutor") as demo:
         "performance_logger": None,
     })
 
-    msg.submit(respond, [msg, chatbot, state], [chatbot, state, phase_display, msg, export_status])
+    msg.submit(respond, [msg, chatbot, state], [chatbot, state, phase_display, msg, export_status]) \
+        .then(auto_export_if_resolved, [chatbot, state], export_status)
     export_btn.click(export_session, [chatbot, state], export_status)
     new_query_btn.click(
         reset_for_new_query,
@@ -1389,4 +1413,8 @@ with gr.Blocks(title="Polaris Tutor") as demo:
     demo.load(None, None, None, js=AUTOSCROLL_JS)
 
 if __name__ == "__main__":
+    # queue() lets the chained .then(auto_export_if_resolved) push its status update
+    # to the browser independently of respond()'s output, so the chat reply renders
+    # first and the export runs afterward rather than as one blocking operation.
+    demo.queue()
     demo.launch()
