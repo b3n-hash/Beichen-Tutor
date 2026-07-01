@@ -695,7 +695,29 @@ def enforce_consistency(parsed: dict, previous_state: dict) -> dict:
     return parsed
 
 
-def respond(message, history, state):
+PLACEHOLDER_TEXT = "🦉 Běichén is thinking..."
+
+
+def add_placeholder(message, history):
+    """Fast, synchronous, no LLM call. Appends the learner's message and a
+    placeholder assistant bubble, then returns immediately so the learner sees
+    something before respond() even starts. Chained into respond() via .then()."""
+    history = (history or []) + [
+        {"role": "user", "content": message},
+        {"role": "assistant", "content": PLACEHOLDER_TEXT},
+    ]
+    return history, ""  # "" clears the message textbox immediately
+
+
+def respond(history, state):
+    # add_placeholder appended [learner message, placeholder] just before this ran.
+    # Recover the message, then drop BOTH appended turns so `history` is exactly what
+    # respond() always received (prior turns only) — its body re-appends the learner
+    # turn and the real reply itself, unchanged. NOTE: drop two (placeholder + user),
+    # not one: this codebase's respond() appends both roles at every return point, so
+    # keeping the user turn here would duplicate the learner's message downstream.
+    message = history[-2]["content"]
+    history = history[:-2]
     history = history or []
     state = state or {
         "phase": "ask",
@@ -1396,7 +1418,8 @@ with gr.Blocks(title="Polaris Tutor") as demo:
         "performance_logger": None,
     })
 
-    msg.submit(respond, [msg, chatbot, state], [chatbot, state, phase_display, msg, export_status]) \
+    msg.submit(add_placeholder, [msg, chatbot], [chatbot, msg], show_progress="hidden") \
+        .then(respond, [chatbot, state], [chatbot, state, phase_display, msg, export_status]) \
         .then(auto_export_if_resolved, [chatbot, state], export_status)
     export_btn.click(export_session, [chatbot, state], export_status)
     new_query_btn.click(

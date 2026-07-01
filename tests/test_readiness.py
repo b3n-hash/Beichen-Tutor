@@ -101,7 +101,13 @@ print(f"  after signal: pending_intent={session.pending_intent}, "
 check("pending_intent still CONCLUDE (PARTIAL)", session.pending_intent, LearnerIntent.CONCLUDE)
 
 # Step B: learner replies "yes, go ahead" -> override path.
-history, state, _, _, _ = app.respond("yes, go ahead", history, state)
+# respond() now takes (history, state); the UI's add_placeholder step appends the
+# learner message + placeholder bubble first, so simulate that here.
+history = history + [
+    {"role": "user", "content": "yes, go ahead"},
+    {"role": "assistant", "content": app.PLACEHOLDER_TEXT},
+]
+history, state, _, _, _ = app.respond(history, state)
 print(f"  after override: pending_intent={session.pending_intent}, "
       f"skipped_component_ids={session.skipped_component_ids}")
 check("skipped_component_ids == [uncovered.id]", session.skipped_component_ids, [uncovered_id])
